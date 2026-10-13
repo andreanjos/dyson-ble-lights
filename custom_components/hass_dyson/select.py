@@ -1,0 +1,1421 @@
+"""Select platform for Dyson integration."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from homeassistant.components.select import SelectEntity
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from .const import (
+    DEVICE_CATEGORY_ROBOT,
+    DOMAIN,
+    ROBOT_POWER_OPTIONS_360_EYE,
+    ROBOT_POWER_OPTIONS_HEURIST,
+    ROBOT_POWER_OPTIONS_VIS_NAV,
+)
+from .coordinator import DysonDataUpdateCoordinator
+from .entity import DysonEntity
+from .spot_scrub_select import DysonSpotScrubCleaningModeSelect
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Dyson select platform."""
+    from .entry_routing import async_route_ble_platform
+
+    if (
+        await async_route_ble_platform(hass, config_entry, async_add_entities, "select")
+        is not None
+    ):
+        return None
+
+    coordinator: DysonDataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+
+    entities: list[SelectEntity] = []
+
+    if coordinator.device and coordinator.device.mqtt_prefix == "RB05":
+        entities.append(DysonSpotScrubCleaningModeSelect(coordinator))
+
+    # Add additional selects based on capabilities
+    device_capabilities = coordinator.device_capabilities
+
+    # Only show oscillation mode select for devices with advanced oscillation capability
+    if "AdvanceOscillationDay1" in device_capabilities:
+        entities.append(DysonOscillationModeSelect(coordinator))
+    elif "AdvanceOscillationDay0" in device_capabilities:
+        entities.append(DysonOscillationModeDay0Select(coordinator))
+
+    # Add water hardness select for humidifier devices
+    if "Humidifier" in device_capabilities:
+        entities.append(DysonWaterHardnessSelect(coordinator))
+
+    # Add robot vacuum power level selects based on device category and capabilities
+    device_categories = getattr(coordinator, "device_category", [])
+    if isinstance(device_categories, list) and any(
+        cat == DEVICE_CATEGORY_ROBOT for cat in device_categories
+    ):
+        # Detect specific robot model.
+        # Cloud-discovered devices often have empty device_capabilities, so fall
+        # back to matching on device_name when the capability strings are absent.
+        device_name = (coordinator.config_entry.data.get("device_name") or "").lower()
+
+        is_vis_nav = (
+            all(cap in device_capabilities for cap in ["Mapping", "DirectedCleaning"])
+            or "vis nav" in device_name
+        )
+        is_heurist = "Heat" in device_capabilities or "heurist" in device_name
+
+        if is_vis_nav:
+            entities.append(DysonRobotPowerVisNavSelect(coordinator))
+        elif is_heurist:
+            entities.append(DysonRobotPowerHeuristSelect(coordinator))
+        else:
+            # Default to 360 Eye for other robot devices
+            entities.append(DysonRobotPower360EyeSelect(coordinator))
+            _LOGGER.debug(
+                "Robot device %s has unknown power capabilities, using generic power select",
+                coordinator.serial_number,
+            )
+            entities.append(DysonRobotPowerGenericSelect(coordinator))
+
+    # Add tilt oscillation select for ec devices that report the oton key in state.
+    # These devices (e.g. BP04) have no dedicated capability flag; presence of oton
+    # in the first STATE-CHANGE product-state is the sole gating criterion.
+    device_categories = getattr(coordinator, "device_category", [])
+    if isinstance(device_categories, list) and "ec" in device_categories:
+        product_state = {}
+        if coordinator.data:
+            product_state = coordinator.data.get("product-state", {})
+        if "oton" in product_state:
+            entities.append(DysonTiltOscillationModeSelect(coordinator))
+
+    # Note: Heating mode control is now integrated into the fan entity's preset modes
+    # No separate heating mode select needed
+
+    async_add_entities(entities, True)
+
+
+class DysonOscillationModeSelect(DysonEntity, SelectEntity):
+    """Select entity for oscillation mode."""
+
+    coordinator: DysonDataUpdateCoordinator
+
+    def __init__(self, coordinator: DysonDataUpdateCoordinator) -> None:
+        """Initialize the oscillation mode select."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_oscillation_mode"
+        self._attr_translation_key = "oscillation_mode"
+        self._attr_icon = "mdi:rotate-3d-variant"
+        self._attr_options = ["45°", "90°", "180°", "350°", "Custom"]
+        # Breeze mode is only available on devices that also have Humidifier capability
+        if "Humidifier" in coordinator.device_capabilities:
+            self._attr_options.insert(self._attr_options.index("Custom"), "Breeze")
+        # ``_saved_sweep_midpoint`` stores the HA-computed midpoint of osal/osau
+        # (i.e. (osal + osau) / 2) before entering 350° mode so that the fan's
+        # pointing direction can be restored when the user leaves 350° mode.
+        # This is entirely a HA-side concept and has NO relation to ``ancp``
+        # (Angle Current Preset), which is a device/app preset identifier.
+        self._saved_sweep_midpoint: int | None = None
+        self._last_known_mode: str | None = None  # Track mode transitions
+        if coordinator.data and coordinator.device:
+            self._attr_current_option = self._detect_mode_from_angles()
+        else:
+            self._attr_current_option = None
+
+    def _calculate_sweep_midpoint(self) -> int:
+        """Calculate the midpoint of the current sweep range from osal/osau.
+
+        This is a HA-side concept used to preserve the fan's pointing direction
+        when switching between preset modes.  It is computed as ``(osal + osau)
+        // 2`` and has no relation to ``ancp`` (Angle Current Preset), which is
+        a device/app label for the active named preset.
+
+        Returns:
+            The midpoint in degrees, or 175 if osal/osau cannot be read.
+        """
+        if not self.coordinator.device:
+            return 175
+
+        product_state = self.coordinator.data.get("product-state", {})
+
+        try:
+            lower_data = self.coordinator.device.get_state_value(
+                product_state, "osal", "0000"
+            )
+            upper_data = self.coordinator.device.get_state_value(
+                product_state, "osau", "0350"
+            )
+            lower_angle = int(lower_data.lstrip("0") or "0")
+            upper_angle = int(upper_data.lstrip("0") or "350")
+            return (lower_angle + upper_angle) // 2
+        except (ValueError, TypeError):
+            return 175  # Cannot read osal/osau; use midpoint of full range
+
+    # Maps ``ancp`` (Angle Current Preset) values to HA option strings.
+    # The device and MyDyson app use these codes when a named preset is active.
+    _PRESET_ANCP_MAP: dict[str, str] = {
+        "0045": "45°",
+        "0090": "90°",
+        "0180": "180°",
+        "0350": "350°",
+    }
+
+    # Maps span values (degrees) to HA option strings for span-based snap detection.
+    # Used when the device reports ancp=CUST after a center/span move: if the
+    # resulting span still matches a named preset the mode select snaps back to
+    # that preset, mirroring the Dyson app behaviour.
+    _PRESET_SPAN_MAP: dict[int, str] = {
+        45: "45°",
+        90: "90°",
+        180: "180°",
+        350: "350°",
+    }
+
+    def _detect_mode_from_angles(self) -> str:
+        """Detect current oscillation mode from device state.
+
+        This method is intentionally oson-agnostic.  Oscillation on/off state
+        is owned by the fan entity's oscillate toggle; the mode select only
+        reflects the configured oscillation pattern (ancp / angle preset).
+        """
+        if not self.coordinator.device:
+            return "Custom"
+
+        product_state = self.coordinator.data.get("product-state", {})
+
+        ancp = self.coordinator.device.get_state_value(product_state, "ancp", "")
+
+        if ancp == "BRZE" and "Breeze" in self._attr_options:
+            return "Breeze"
+
+        # Trust ancp for named presets.  The HA integration sends
+        # {ancp:X, osal:Y, osau:Z, oson:ON} for preset selections.  The device
+        # echoes back the new ancp value in its STATE-CHANGE confirmation but
+        # does NOT always echo osal/osau changes — ancp is the reliable signal.
+        if ancp in self._PRESET_ANCP_MAP:
+            return self._PRESET_ANCP_MAP[ancp]
+
+        # ancp is "CUST" (or unknown) — device is using explicit osal/osau.
+        # If the current span matches a named preset value, snap to that preset
+        # so that moving the center while in e.g. 90° mode keeps showing "90°",
+        # matching the Dyson app behaviour.
+        try:
+            lower_str = self.coordinator.device.get_state_value(
+                product_state, "osal", "0000"
+            )
+            upper_str = self.coordinator.device.get_state_value(
+                product_state, "osau", "0350"
+            )
+            lower = int(lower_str.lstrip("0") or "0")
+            upper = int(upper_str.lstrip("0") or "350")
+            span = upper - lower
+            if span in self._PRESET_SPAN_MAP:
+                return self._PRESET_SPAN_MAP[span]
+        except (ValueError, TypeError):
+            pass
+
+        return "Custom"
+
+    def _should_save_midpoint_on_state_change(self, new_mode: str) -> bool:
+        """Return True when an external device change just entered 350° mode.
+
+        On that transition we capture the current sweep midpoint so it can be
+        restored if the user later picks a non-350° preset via HA.
+        """
+        return (
+            new_mode == "350°"
+            and self._last_known_mode != "350°"
+            and self._last_known_mode is not None
+            and self._saved_sweep_midpoint is None  # Only save once per entry
+        )
+
+    def _should_restore_midpoint_on_state_change(self, new_mode: str) -> bool:
+        """Return True when an external device change just left 350° mode.
+
+        This signals that a previously saved sweep midpoint is now stale and
+        should be cleared (the device itself chose the new position).
+        """
+        return (
+            self._last_known_mode == "350°"
+            and new_mode != "350°"
+            and self._saved_sweep_midpoint is not None
+        )
+
+    def _calculate_angles_for_preset(
+        self, preset_angle: int, sweep_midpoint: int = 175
+    ) -> tuple[int, int]:
+        """Return (lower, upper) angles for *preset_angle* centred on *sweep_midpoint*.
+
+        *sweep_midpoint* is the HA-computed midpoint of the current osal/osau
+        range (see ``_calculate_sweep_midpoint``).  It is used purely as a
+        positioning hint and is unrelated to ``ancp``.
+        """
+        if preset_angle == 350:
+            return 0, 350
+
+        lower, upper = self._calculate_initial_angles(preset_angle, sweep_midpoint)
+        return self._apply_boundary_constraints(
+            lower, upper, preset_angle, sweep_midpoint
+        )
+
+    def _calculate_initial_angles(
+        self, preset_angle: int, sweep_midpoint: int
+    ) -> tuple[int, int]:
+        """Calculate initial lower and upper angles centred on *sweep_midpoint*."""
+        half_span = preset_angle / 2.0
+        ideal_lower = sweep_midpoint - half_span
+        ideal_upper = sweep_midpoint + half_span
+
+        lower = int(round(ideal_lower))
+        upper = int(round(ideal_upper))
+
+        # Ensure the span is exactly the preset angle
+        if upper - lower != preset_angle:
+            upper = lower + preset_angle
+
+        return lower, upper
+
+    def _apply_boundary_constraints(
+        self, lower: int, upper: int, preset_angle: int, sweep_midpoint: int
+    ) -> tuple[int, int]:
+        """Clamp (lower, upper) to the 0-350° range, keeping midpoint as close as possible."""
+        if lower < 0:
+            lower, upper = self._handle_lower_boundary_violation(preset_angle)
+        elif upper > 350:
+            lower, upper = self._handle_upper_boundary_violation(preset_angle)
+
+        return self._optimize_centering_within_bounds(
+            lower, upper, preset_angle, sweep_midpoint
+        )
+
+    def _handle_lower_boundary_violation(self, preset_angle: int) -> tuple[int, int]:
+        """Handle case where lower bound is violated."""
+        # Shift entire range right to fit bounds
+        lower = 0
+        upper = min(350, preset_angle)  # Ensure we don't exceed bounds
+        # If we can't fit the full span, compress symmetrically around center
+        if upper > 350:
+            upper = 350
+            lower = max(0, 350 - preset_angle)
+        return lower, upper
+
+    def _handle_upper_boundary_violation(self, preset_angle: int) -> tuple[int, int]:
+        """Handle case where upper bound is violated."""
+        # Shift entire range left to fit bounds
+        upper = 350
+        lower = max(0, 350 - preset_angle)
+        return lower, upper
+
+    def _optimize_centering_within_bounds(
+        self, lower: int, upper: int, preset_angle: int, sweep_midpoint: int
+    ) -> tuple[int, int]:
+        """Shift (lower, upper) as close to *sweep_midpoint* as boundary allows."""
+        if lower == 0 or upper == 350:
+            available_span = upper - lower
+            if available_span >= preset_angle:
+                lower, upper = self._recenter_within_available_space(
+                    lower, upper, sweep_midpoint
+                )
+
+        return int(lower), int(upper)
+
+    def _recenter_within_available_space(
+        self, lower: int, upper: int, sweep_midpoint: int
+    ) -> tuple[int, int]:
+        """Shift (lower, upper) toward *sweep_midpoint* within available travel."""
+        actual_midpoint = (lower + upper) / 2.0
+        if actual_midpoint != sweep_midpoint:
+            diff = sweep_midpoint - actual_midpoint
+            max_shift_left = lower
+            max_shift_right = 350 - upper
+
+            if diff > 0 and max_shift_right > 0:
+                shift = min(diff, max_shift_right)
+                lower += int(shift)
+                upper += int(shift)
+            elif diff < 0 and max_shift_left > 0:
+                shift = min(-diff, max_shift_left)
+                lower -= int(shift)
+                upper -= int(shift)
+
+        return lower, upper
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator with hybrid center preservation."""
+        if not self.coordinator.device:
+            self._attr_current_option = None
+            super()._handle_coordinator_update()
+            return
+
+        # Detect current mode from device state
+        detected_mode = self._detect_mode_from_angles()
+
+        # Save the sweep midpoint when an external event moves the device into
+        # 350° mode so we can restore it if the user later picks a preset via HA.
+        if self._should_save_midpoint_on_state_change(detected_mode):
+            midpoint = self._calculate_sweep_midpoint()
+            self._saved_sweep_midpoint = midpoint
+            _LOGGER.debug(
+                "Saving sweep midpoint %s° before external switch to 350° (from %s) for %s",
+                midpoint,
+                self._last_known_mode,
+                self.coordinator.serial_number,
+            )
+        elif self._should_restore_midpoint_on_state_change(detected_mode):
+            # Device changed out of 350° without going via HA (e.g. app/remote).
+            # The saved midpoint is now stale; discard it so a future HA-driven
+            # preset selection doesn't restore an outdated position.
+            _LOGGER.debug(
+                "Discarding stale saved midpoint %s° after external exit from 350° to %s for %s",
+                self._saved_sweep_midpoint,
+                detected_mode,
+                self.coordinator.serial_number,
+            )
+            self._saved_sweep_midpoint = None
+
+        # Update the current option
+        self._attr_current_option = detected_mode
+
+        # Track mode changes for next iteration
+        self._last_known_mode = detected_mode
+
+        super()._handle_coordinator_update()
+
+    async def async_select_option(self, option: str) -> None:
+        """Select the oscillation mode with center-point preservation."""
+        if not self.coordinator.device:
+            return
+
+        try:
+            if option == "Breeze":
+                await self.coordinator.device.set_oscillation_breeze()
+                return
+
+            if option == "Custom":
+                # Re-send the current osal/osau with ancp=CUST to explicitly put
+                # the device into custom mode (e.g. when switching from a named
+                # preset).  Does not touch oson.
+                product_state = self.coordinator.data.get("product-state", {})
+                lower_str = self.coordinator.device.get_state_value(
+                    product_state, "osal", "0000"
+                )
+                upper_str = self.coordinator.device.get_state_value(
+                    product_state, "osau", "0350"
+                )
+                lower = int(lower_str.lstrip("0") or "0")
+                upper = int(upper_str.lstrip("0") or "350")
+                await self.coordinator.device.set_oscillation_angles(lower, upper)
+                return
+
+            # Named preset modes: 45°, 90°, 180°, 350°.
+            # Always send osal/osau alongside the preset so the device has a
+            # valid sweep range.  Without explicit angles the device ignores
+            # oson=ON when the current span is 0 (point-aim mode).  The angles
+            # are centred on the current sweep midpoint so the fan keeps facing
+            # roughly the same direction.
+            preset_angle = int(option.replace("°", ""))
+            sweep_midpoint = self._calculate_sweep_midpoint()
+            lower, upper = self._calculate_angles_for_preset(
+                preset_angle, sweep_midpoint
+            )
+            await self.coordinator.device.set_oscillation_preset(
+                preset_angle, lower, upper
+            )
+
+            _LOGGER.debug(
+                "Set oscillation preset to %s° (ancp=%04d) for %s",
+                preset_angle,
+                preset_angle,
+                self.coordinator.serial_number,
+            )
+
+        except (ConnectionError, TimeoutError) as err:
+            _LOGGER.error(
+                "Communication error setting oscillation mode to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+        except ValueError as err:
+            _LOGGER.error(
+                "Invalid oscillation mode '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+        except Exception as err:
+            _LOGGER.error(
+                "Unexpected error setting oscillation mode to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return oscillation mode state attributes for scene support."""
+        if not self.coordinator.device:
+            return None
+
+        attributes = {}
+        product_state = self.coordinator.data.get("product-state", {})
+
+        # Current oscillation mode for scene support
+        attributes["oscillation_mode"] = self._attr_current_option
+
+        # Oscillation state details.
+        # Settled Breeze state is oson=ON (device manages its own oscillation
+        # internally); oson=OFF always means oscillation is genuinely disabled.
+        oson = self.coordinator.device.get_state_value(product_state, "oson", "OFF")
+        oscillation_enabled: bool = oson == "ON"
+        attributes["oscillation_enabled"] = oscillation_enabled  # type: ignore[assignment]
+
+        # Current angle configuration
+        try:
+            lower_data = self.coordinator.device.get_state_value(
+                product_state, "osal", "0000"
+            )
+            upper_data = self.coordinator.device.get_state_value(
+                product_state, "osau", "0350"
+            )
+            lower_angle: int = int(lower_data.lstrip("0") or "0")
+            upper_angle: int = int(upper_data.lstrip("0") or "350")
+            # sweep_midpoint is our HA-computed midpoint of osal/osau.
+            # It is NOT related to ancp (Angle Current Preset).
+            sweep_midpoint: int = (lower_angle + upper_angle) // 2
+            span: int = upper_angle - lower_angle
+
+            attributes["oscillation_angle_low"] = lower_angle  # type: ignore[assignment]
+            attributes["oscillation_angle_high"] = upper_angle  # type: ignore[assignment]
+            attributes["oscillation_center"] = sweep_midpoint  # type: ignore[assignment]
+            attributes["oscillation_span"] = span  # type: ignore[assignment]
+        except (ValueError, TypeError):
+            pass
+
+        return attributes
+
+
+class DysonOscillationModeDay0Select(DysonEntity, SelectEntity):
+    """Select entity for oscillation mode (AdvanceOscillationDay0 capability)."""
+
+    coordinator: DysonDataUpdateCoordinator
+    _PRESET_ANCP_MAP: dict[str, str] = {"0015": "15°", "0040": "40°", "0070": "70°"}
+
+    def __init__(self, coordinator: DysonDataUpdateCoordinator) -> None:
+        """Initialize the oscillation mode select for Day0."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_oscillation_mode"
+        self._attr_translation_key = "oscillation"
+        self._attr_icon = "mdi:rotate-3d-variant"
+        # Simplified to just the three working preset options
+        self._attr_options = ["Off", "15°", "40°", "70°"]
+        # Fixed center angle for Day0 - middle of allowed range (142°-212°)
+        self._center_angle = 177
+        if coordinator.data and coordinator.device:
+            self._attr_current_option = self._detect_mode_from_angles()
+        else:
+            self._attr_current_option = None
+
+    def _detect_mode_from_angles(self) -> str:
+        """Detect current oscillation mode from device ANCP value."""
+        if not self.coordinator.device:
+            return "Off"
+
+        product_state = self.coordinator.data.get("product-state", {})
+        oson = self.coordinator.device.get_state_value(product_state, "oson", "OFF")
+
+        if oson == "OFF":
+            return "Off"
+
+        # Day0 devices use ancp as a zero-padded preset code ("0015", "0040", "0070")
+        ancp_raw = self.coordinator.device.get_state_value(
+            product_state, "ancp", "0040"
+        )
+        detected_mode = self._PRESET_ANCP_MAP.get(ancp_raw, "40°")
+
+        _LOGGER.debug(
+            "Day0: Detected mode from ancp=%s -> '%s' for %s",
+            ancp_raw,
+            detected_mode,
+            self.coordinator.serial_number,
+        )
+
+        return detected_mode
+
+    def _get_day0_angles_and_ancp(self, preset_angle: int) -> tuple[int, int, str]:
+        """Get fixed angles and ancp code for Day0 preset mode."""
+        # Day0 devices use fixed physical angles but variable ancp
+        # Based on MQTT trace: osal=0157, osau=0197, ancp=zero-padded preset code
+        lower_angle = 157
+        upper_angle = 197
+        ancp_code = f"{preset_angle:04d}"
+
+        _LOGGER.debug(
+            "Day0: Fixed angles for %s° preset: %s°-%s° with ancp=%s for %s",
+            preset_angle,
+            lower_angle,
+            upper_angle,
+            ancp_code,
+            self.coordinator.serial_number,
+        )
+
+        return lower_angle, upper_angle, ancp_code
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        if self.coordinator.device:
+            detected_mode = self._detect_mode_from_angles()
+            self._attr_current_option = detected_mode
+        else:
+            self._attr_current_option = None
+
+        super()._handle_coordinator_update()
+
+    async def async_select_option(self, option: str) -> None:
+        """Select the oscillation mode for Day0."""
+        if not self.coordinator.device:
+            return
+
+        try:
+            if option == "Off":
+                await self.coordinator.device.set_oscillation(False)
+                _LOGGER.debug(
+                    "Day0: Turned off oscillation for %s",
+                    self.coordinator.serial_number,
+                )
+                return
+
+            # Get Day0 angles and ancp for the selected preset
+            preset_angle = int(option.replace("°", ""))
+            lower_angle, upper_angle, ancp_code = self._get_day0_angles_and_ancp(
+                preset_angle
+            )
+
+            _LOGGER.debug(
+                "Day0: Setting %s° mode for %s -> fixed angles %s°-%s° with ancp=%s",
+                preset_angle,
+                self.coordinator.serial_number,
+                lower_angle,
+                upper_angle,
+                ancp_code,
+            )
+
+            # Apply the fixed angles and ancp using Day0-specific method
+            await self.coordinator.device.set_oscillation_angles_day0(
+                lower_angle, upper_angle, ancp_code
+            )
+
+            _LOGGER.debug(
+                "Day0: Successfully set %s° oscillation mode for %s",
+                preset_angle,
+                self.coordinator.serial_number,
+            )
+
+        except (ConnectionError, TimeoutError) as err:
+            _LOGGER.error(
+                "Communication error setting Day0 oscillation mode to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+        except ValueError as err:
+            _LOGGER.error(
+                "Invalid Day0 oscillation mode '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+        except Exception as err:
+            _LOGGER.error(
+                "Unexpected error setting Day0 oscillation mode to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return oscillation mode state attributes for scene support."""
+        if not self.coordinator.device:
+            return None
+
+        attributes = {}
+        product_state = self.coordinator.data.get("product-state", {})
+
+        # Current oscillation mode for scene support
+        attributes["oscillation_mode"] = self._attr_current_option
+
+        # Oscillation state details
+        oson = self.coordinator.device.get_state_value(product_state, "oson", "OFF")
+        oscillation_enabled: bool = oson == "ON"
+        attributes["oscillation_enabled"] = oscillation_enabled  # type: ignore[assignment]
+
+        # Current angle configuration
+        try:
+            lower_data = self.coordinator.device.get_state_value(
+                product_state, "osal", "0000"
+            )
+            upper_data = self.coordinator.device.get_state_value(
+                product_state, "osau", "0350"
+            )
+
+            lower_angle: int = int(lower_data.lstrip("0") or "0")
+            upper_angle: int = int(upper_data.lstrip("0") or "350")
+            span: int = upper_angle - lower_angle
+
+            attributes["oscillation_angle_low"] = lower_angle  # type: ignore[assignment]
+            attributes["oscillation_angle_high"] = upper_angle  # type: ignore[assignment]
+            attributes["oscillation_center"] = self._center_angle  # type: ignore[assignment]
+            attributes["oscillation_span"] = span  # type: ignore[assignment]
+            attributes["oscillation_day0_mode"] = True  # type: ignore[assignment]
+        except (ValueError, TypeError):
+            pass
+
+        return attributes
+
+
+class DysonHeatingModeSelect(DysonEntity, SelectEntity):
+    """Select entity for heating mode."""
+
+    coordinator: DysonDataUpdateCoordinator
+
+    def __init__(self, coordinator: DysonDataUpdateCoordinator) -> None:
+        """Initialize the heating mode select."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_heating_mode"
+        self._attr_translation_key = "heating_mode"
+        self._attr_icon = "mdi:radiator"
+        self._attr_options = ["Off", "Heating", "Auto Heat"]
+        if coordinator.data and coordinator.device:
+            product_state = coordinator.data.get("product-state", {})
+            hmod = coordinator.device.get_state_value(product_state, "hmod", "OFF")
+            if hmod == "HEAT":
+                self._attr_current_option = "Heating"
+            elif hmod != "OFF":
+                self._attr_current_option = "Auto Heat"
+            else:
+                self._attr_current_option = "Off"
+        else:
+            self._attr_current_option = "Off"
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        if self.coordinator.device:
+            # Get heating mode from device state (hmod)
+            product_state = self.coordinator.data.get("product-state", {})
+            hmod = self.coordinator.device.get_state_value(product_state, "hmod", "OFF")
+            if hmod == "OFF":
+                self._attr_current_option = "Off"
+            elif hmod == "HEAT":
+                self._attr_current_option = "Heating"
+            else:
+                self._attr_current_option = "Auto Heat"
+        else:
+            self._attr_current_option = None
+        super()._handle_coordinator_update()
+
+    async def async_select_option(self, option: str) -> None:
+        """Select the heating mode."""
+        if not self.coordinator.device:
+            return
+
+        try:
+            if option == "Off":
+                mode_value = "OFF"
+            elif option == "Heating":
+                mode_value = "HEAT"
+            else:  # Auto Heat
+                mode_value = "AUTO"
+
+            await self.coordinator.device.set_heating_mode(mode_value)
+            _LOGGER.debug(
+                "Set heating mode to %s for %s", option, self.coordinator.serial_number
+            )
+        except (ConnectionError, TimeoutError) as err:
+            _LOGGER.error(
+                "Communication error setting heating mode to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+        except ValueError as err:
+            _LOGGER.error(
+                "Invalid heating mode '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+        except Exception as err:
+            _LOGGER.error(
+                "Unexpected error setting heating mode to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return heating mode state attributes for scene support."""
+        if not self.coordinator.device:
+            return None
+
+        attributes = {}
+        product_state = self.coordinator.data.get("product-state", {})
+
+        # Current heating mode for scene support
+        attributes["heating_mode"] = self._attr_current_option
+
+        # Device heating state details
+        hmod = self.coordinator.device.get_state_value(product_state, "hmod", "OFF")
+        attributes["heating_mode_raw"] = hmod
+        heating_enabled: bool = hmod != "OFF"
+        attributes["heating_enabled"] = heating_enabled  # type: ignore[assignment]
+
+        # Include target temperature if available
+        try:
+            hmax = self.coordinator.device.get_state_value(
+                product_state, "hmax", "2980"
+            )
+            temp_kelvin: float = int(hmax) / 10  # Device reports in 0.1K increments
+            target_celsius: float = temp_kelvin - 273.15
+            attributes["target_temperature"] = round(target_celsius, 1)  # type: ignore[assignment]
+            attributes["target_temperature_kelvin"] = hmax
+        except (ValueError, TypeError):
+            pass
+
+        return attributes
+
+
+class DysonWaterHardnessSelect(DysonEntity, SelectEntity):
+    """Select entity for water hardness setting on humidifier devices."""
+
+    coordinator: DysonDataUpdateCoordinator
+
+    def __init__(self, coordinator: DysonDataUpdateCoordinator) -> None:
+        """Initialize the water hardness select."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_water_hardness"
+        self._attr_translation_key = "water_hardness"
+        self._attr_icon = "mdi:water-percent"
+        self._attr_options = ["Soft", "Medium", "Hard"]
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        if self.coordinator.device:
+            product_state = self.coordinator.data.get("product-state", {})
+
+            # Get water hardness from device state
+            water_hardness = self.coordinator.device.get_state_value(
+                product_state,
+                "wath",
+                "1350",  # Default to Medium
+            )
+
+            # Map device values to display names
+            if water_hardness == "0675":
+                self._attr_current_option = "Soft"
+            elif water_hardness == "1350":
+                self._attr_current_option = "Medium"
+            elif water_hardness == "2025":
+                self._attr_current_option = "Hard"
+            else:
+                _LOGGER.warning(
+                    "Unknown water hardness value '%s' for %s, defaulting to Medium",
+                    water_hardness,
+                    self.coordinator.serial_number,
+                )
+                self._attr_current_option = "Medium"
+        else:
+            self._attr_current_option = None
+
+        super()._handle_coordinator_update()
+
+    async def async_select_option(self, option: str) -> None:
+        """Select new water hardness option."""
+        if not self.coordinator.device:
+            return
+
+        # Map display names to device values
+        value_map = {
+            "Soft": "0675",
+            "Medium": "1350",
+            "Hard": "2025",
+        }
+
+        if option not in value_map:
+            _LOGGER.error(
+                "Invalid water hardness option '%s' for %s. Valid options: %s",
+                option,
+                self.coordinator.serial_number,
+                list(value_map.keys()),
+            )
+            return
+
+        try:
+            await self.coordinator.device.set_water_hardness(option.lower())
+
+            # Update local state immediately for responsive UI
+            self._attr_current_option = option
+            self.async_write_ha_state()
+
+            _LOGGER.debug(
+                "Set water hardness to '%s' for %s",
+                option,
+                self.coordinator.serial_number,
+            )
+        except (ConnectionError, TimeoutError) as err:
+            _LOGGER.error(
+                "Communication error setting water hardness to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+        except ValueError as err:
+            _LOGGER.error(
+                "Invalid water hardness option '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+        except Exception as err:
+            _LOGGER.error(
+                "Unexpected error setting water hardness to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return water hardness state attributes for scene support."""
+        if not self.coordinator.device:
+            return None
+
+        attributes = {}
+        product_state = self.coordinator.data.get("product-state", {})
+
+        # Current water hardness for scene support
+        attributes["water_hardness"] = self._attr_current_option
+
+        # Raw device value
+        wath = self.coordinator.device.get_state_value(product_state, "wath", "1350")
+        attributes["water_hardness_raw"] = wath
+
+        return attributes
+
+
+class DysonRobotPower360EyeSelect(DysonEntity, SelectEntity):
+    """Select entity for Dyson 360 Eye robot vacuum power level."""
+
+    coordinator: DysonDataUpdateCoordinator
+
+    def __init__(self, coordinator: DysonDataUpdateCoordinator) -> None:
+        """Initialize the 360 Eye robot power select."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_robot_power_360_eye"
+        self._attr_translation_key = "robot_power_360_eye"
+        self._attr_icon = "mdi:vacuum"
+        self._attr_options = list(ROBOT_POWER_OPTIONS_360_EYE.values())
+        if coordinator.data and coordinator.device:
+            current_power = coordinator.data.get("product-state", {}).get("fPwr")
+            self._attr_current_option = (
+                ROBOT_POWER_OPTIONS_360_EYE.get(current_power)
+                or list(ROBOT_POWER_OPTIONS_360_EYE.values())[0]
+            )
+        else:
+            self._attr_current_option = list(ROBOT_POWER_OPTIONS_360_EYE.values())[0]
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        if not self.coordinator.device:
+            self._attr_current_option = None
+            return
+
+        # Get current robot power level from device state
+        # Robot devices report power level in product-state.fPwr field
+        try:
+            device_state = self.coordinator.device._state_data.get("product-state", {})
+            current_power = device_state.get("fPwr")
+            if current_power and current_power in ROBOT_POWER_OPTIONS_360_EYE:
+                self._attr_current_option = ROBOT_POWER_OPTIONS_360_EYE[current_power]
+            else:
+                # Default to first option if power level not found
+                self._attr_current_option = list(ROBOT_POWER_OPTIONS_360_EYE.values())[
+                    0
+                ]
+        except (AttributeError, KeyError):
+            self._attr_current_option = list(ROBOT_POWER_OPTIONS_360_EYE.values())[0]
+        self.async_write_ha_state()
+
+    async def async_select_option(self, option: str) -> None:
+        """Change the selected robot power level."""
+        if not self.coordinator.device:
+            _LOGGER.error("Device not available for power level change")
+            return
+
+        # Find the command value for the selected option
+        command_value = None
+        for cmd_val, display_name in ROBOT_POWER_OPTIONS_360_EYE.items():
+            if display_name == option:
+                command_value = cmd_val
+                break
+
+        if command_value is None:
+            _LOGGER.error("Unknown power level option: %s", option)
+            return
+
+        try:
+            _LOGGER.info(
+                "Setting 360 Eye robot power to '%s' (%s) for %s",
+                option,
+                command_value,
+                self.coordinator.serial_number,
+            )
+
+            # Send robot power level command via device method
+            await self.coordinator.device.set_robot_power(command_value, "360eye")
+
+            # Update local state immediately for responsive UI
+            self._attr_current_option = option
+            self.async_write_ha_state()
+
+            _LOGGER.debug(
+                "Set 360 Eye robot power to '%s' for %s",
+                option,
+                self.coordinator.serial_number,
+            )
+        except Exception as err:
+            _LOGGER.error(
+                "Error setting 360 Eye robot power to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+
+
+class DysonRobotPowerHeuristSelect(DysonEntity, SelectEntity):
+    """Select entity for Dyson 360 Heurist robot vacuum power level."""
+
+    coordinator: DysonDataUpdateCoordinator
+
+    def __init__(self, coordinator: DysonDataUpdateCoordinator) -> None:
+        """Initialize the 360 Heurist robot power select."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_robot_power_heurist"
+        self._attr_translation_key = "robot_power_heurist"
+        self._attr_icon = "mdi:vacuum"
+        self._attr_options = list(ROBOT_POWER_OPTIONS_HEURIST.values())
+        if coordinator.data and coordinator.device:
+            current_power = coordinator.data.get("product-state", {}).get("fPwr")
+            self._attr_current_option = (
+                ROBOT_POWER_OPTIONS_HEURIST.get(
+                    str(current_power) if current_power else ""
+                )
+                or list(ROBOT_POWER_OPTIONS_HEURIST.values())[0]
+            )
+        else:
+            self._attr_current_option = list(ROBOT_POWER_OPTIONS_HEURIST.values())[0]
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        if not self.coordinator.device:
+            self._attr_current_option = None
+            return
+
+        # Get current robot power level from device state
+        # Robot devices report power level in product-state.fPwr field
+        try:
+            device_state = self.coordinator.device._state_data.get("product-state", {})
+            current_power = device_state.get("fPwr")
+            if current_power and str(current_power) in ROBOT_POWER_OPTIONS_HEURIST:
+                self._attr_current_option = ROBOT_POWER_OPTIONS_HEURIST[
+                    str(current_power)
+                ]
+            else:
+                # Default to first option if power level not found
+                self._attr_current_option = list(ROBOT_POWER_OPTIONS_HEURIST.values())[
+                    0
+                ]
+        except (AttributeError, KeyError):
+            self._attr_current_option = list(ROBOT_POWER_OPTIONS_HEURIST.values())[0]
+        self.async_write_ha_state()
+
+    async def async_select_option(self, option: str) -> None:
+        """Change the selected robot power level."""
+        if not self.coordinator.device:
+            _LOGGER.error("Device not available for power level change")
+            return
+
+        # Find the command value for the selected option
+        command_value = None
+        for cmd_val, display_name in ROBOT_POWER_OPTIONS_HEURIST.items():
+            if display_name == option:
+                command_value = cmd_val
+                break
+
+        if command_value is None:
+            _LOGGER.error("Unknown power level option: %s", option)
+            return
+
+        try:
+            _LOGGER.info(
+                "Setting 360 Heurist robot power to '%s' (%s) for %s",
+                option,
+                command_value,
+                self.coordinator.serial_number,
+            )
+
+            # Send robot power level command via device method
+            await self.coordinator.device.set_robot_power(command_value, "heurist")
+
+            # Update local state immediately for responsive UI
+            self._attr_current_option = option
+            self.async_write_ha_state()
+
+            _LOGGER.debug(
+                "Set 360 Heurist robot power to '%s' for %s",
+                option,
+                self.coordinator.serial_number,
+            )
+        except Exception as err:
+            _LOGGER.error(
+                "Error setting 360 Heurist robot power to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+
+
+class DysonRobotPowerVisNavSelect(DysonEntity, SelectEntity):
+    """Select entity for Dyson 360 Vis Nav robot vacuum power level."""
+
+    coordinator: DysonDataUpdateCoordinator
+
+    def __init__(self, coordinator: DysonDataUpdateCoordinator) -> None:
+        """Initialize the 360 Vis Nav robot power select."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_robot_power_vis_nav"
+        self._attr_translation_key = "robot_power_vis_nav"
+        self._attr_icon = "mdi:vacuum"
+        self._attr_options = list(ROBOT_POWER_OPTIONS_VIS_NAV.values())
+        if coordinator.data and coordinator.device:
+            current_power = coordinator.data.get("product-state", {}).get("fPwr")
+            self._attr_current_option = (
+                ROBOT_POWER_OPTIONS_VIS_NAV.get(
+                    str(current_power) if current_power else ""
+                )
+                or list(ROBOT_POWER_OPTIONS_VIS_NAV.values())[0]
+            )
+        else:
+            self._attr_current_option = list(ROBOT_POWER_OPTIONS_VIS_NAV.values())[0]
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        if not self.coordinator.device:
+            self._attr_current_option = None
+            return
+
+        # Get current robot power level from device state
+        # Robot devices report power level in product-state.fPwr field
+        try:
+            device_state = self.coordinator.device._state_data.get("product-state", {})
+            current_power = device_state.get("fPwr")
+            if current_power and str(current_power) in ROBOT_POWER_OPTIONS_VIS_NAV:
+                self._attr_current_option = ROBOT_POWER_OPTIONS_VIS_NAV[
+                    str(current_power)
+                ]
+            else:
+                # Default to first option if power level not found
+                self._attr_current_option = list(ROBOT_POWER_OPTIONS_VIS_NAV.values())[
+                    0
+                ]
+        except (AttributeError, KeyError):
+            self._attr_current_option = list(ROBOT_POWER_OPTIONS_VIS_NAV.values())[0]
+        self.async_write_ha_state()
+
+    async def async_select_option(self, option: str) -> None:
+        """Change the selected robot power level."""
+        if not self.coordinator.device:
+            _LOGGER.error("Device not available for power level change")
+            return
+
+        # Find the command value for the selected option
+        command_value = None
+        for cmd_val, display_name in ROBOT_POWER_OPTIONS_VIS_NAV.items():
+            if display_name == option:
+                command_value = cmd_val
+                break
+
+        if command_value is None:
+            _LOGGER.error("Unknown power level option: %s", option)
+            return
+
+        try:
+            _LOGGER.info(
+                "Setting 360 Vis Nav robot power to '%s' (%s) for %s",
+                option,
+                command_value,
+                self.coordinator.serial_number,
+            )
+
+            # Send robot power level command via device method
+            await self.coordinator.device.set_robot_power(command_value, "vis_nav")
+
+            # Update local state immediately for responsive UI
+            self._attr_current_option = option
+            self.async_write_ha_state()
+
+            _LOGGER.debug(
+                "Set 360 Vis Nav robot power to '%s' for %s",
+                option,
+                self.coordinator.serial_number,
+            )
+        except Exception as err:
+            _LOGGER.error(
+                "Error setting 360 Vis Nav robot power to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+
+
+class DysonRobotPowerGenericSelect(DysonEntity, SelectEntity):
+    """Generic select entity for robot vacuum power level (fallback)."""
+
+    coordinator: DysonDataUpdateCoordinator
+
+    def __init__(self, coordinator: DysonDataUpdateCoordinator) -> None:
+        """Initialize the generic robot power select."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_robot_power_generic"
+        self._attr_translation_key = "robot_power_generic"
+        self._attr_icon = "mdi:vacuum"
+        # Default to Heurist-style options as a reasonable fallback
+        self._attr_options = list(ROBOT_POWER_OPTIONS_HEURIST.values())
+        if coordinator.data and coordinator.device:
+            current_power = coordinator.data.get("product-state", {}).get("fPwr")
+            self._attr_current_option = (
+                ROBOT_POWER_OPTIONS_HEURIST.get(
+                    str(current_power) if current_power else ""
+                )
+                or list(ROBOT_POWER_OPTIONS_HEURIST.values())[0]
+            )
+        else:
+            self._attr_current_option = list(ROBOT_POWER_OPTIONS_HEURIST.values())[0]
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        if not self.coordinator.device:
+            self._attr_current_option = None
+            return
+
+        # Get current robot power level from device state
+        # Robot devices report power level in product-state.fPwr field
+        try:
+            device_state = self.coordinator.device._state_data.get("product-state", {})
+            current_power = device_state.get("fPwr")
+            if current_power and str(current_power) in ROBOT_POWER_OPTIONS_HEURIST:
+                self._attr_current_option = ROBOT_POWER_OPTIONS_HEURIST[
+                    str(current_power)
+                ]
+            else:
+                # Default to first option if power level not found
+                self._attr_current_option = list(ROBOT_POWER_OPTIONS_HEURIST.values())[
+                    0
+                ]
+        except (AttributeError, KeyError):
+            self._attr_current_option = list(ROBOT_POWER_OPTIONS_HEURIST.values())[0]
+        self.async_write_ha_state()
+
+    async def async_select_option(self, option: str) -> None:
+        """Change the selected robot power level."""
+        if not self.coordinator.device:
+            _LOGGER.error("Device not available for power level change")
+            return
+
+        # Find the command value for the selected option
+        command_value = None
+        for cmd_val, display_name in ROBOT_POWER_OPTIONS_HEURIST.items():
+            if display_name == option:
+                command_value = cmd_val
+                break
+
+        if command_value is None:
+            _LOGGER.error("Unknown power level option: %s", option)
+            return
+
+        try:
+            _LOGGER.info(
+                "Setting generic robot power to '%s' (%s) for %s",
+                option,
+                command_value,
+                self.coordinator.serial_number,
+            )
+
+            # Send robot power level command via device method
+            await self.coordinator.device.set_robot_power(command_value, "generic")
+
+            # Update local state immediately for responsive UI
+            self._attr_current_option = option
+            self.async_write_ha_state()
+
+            _LOGGER.debug(
+                "Set generic robot power to '%s' for %s",
+                option,
+                self.coordinator.serial_number,
+            )
+        except Exception as err:
+            _LOGGER.error(
+                "Error setting generic robot power to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+
+
+class DysonTiltOscillationModeSelect(DysonEntity, SelectEntity):
+    """Select entity for tilt (vertical) oscillation mode.
+
+    Supports devices such as the Dyson BP04 (product type 664) that expose
+    the ``oton``/``otal``/``otau``/``anct`` state keys for vertical tilt control.
+    The device has no dedicated capability flag; support is detected by the
+    presence of ``oton`` in the first ``product-state`` reported by the device.
+
+    Options and their MQTT payloads:
+        0°     → {anct: CUST, otal: 0000, otau: 0000}
+        25°    → {anct: CUST, otal: 0025, otau: 0025}
+        50°    → {anct: CUST, otal: 0050, otau: 0050}
+        Breeze → {oton: ON,  anct: BRZE, otal: 0359, otau: 0359}
+
+    State reading uses ``oton`` as the primary gate (``ON`` → Breeze) then
+    ``otal`` for the angle (``0025`` → 25°, ``0050`` → 50°, ``0000`` → 0°).
+    """
+
+    coordinator: DysonDataUpdateCoordinator
+
+    def __init__(self, coordinator: DysonDataUpdateCoordinator) -> None:
+        """Initialize the tilt oscillation mode select."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.serial_number}_tilt_oscillation_mode"
+        self._attr_translation_key = "tilt_oscillation_mode"
+        self._attr_icon = "mdi:angle-acute"
+        self._attr_options = ["0°", "25°", "50°", "Breeze"]
+        if coordinator.data and coordinator.device:
+            self._attr_current_option = self._detect_tilt_mode()
+        else:
+            self._attr_current_option = "0°"
+
+    def _detect_tilt_mode(self) -> str:
+        """Detect the current tilt oscillation mode from device state.
+
+        Returns:
+            One of "0°", "25°", "50°", "Breeze".
+        """
+        if not self.coordinator.device:
+            return "0°"
+
+        product_state = self.coordinator.data.get("product-state", {})
+        oton = self.coordinator.device.get_state_value(product_state, "oton", "OFF")
+
+        if oton == "ON":
+            return "Breeze"
+
+        otal = self.coordinator.device.get_state_value(product_state, "otal", "0000")
+        if otal == "0025":
+            return "25°"
+        if otal == "0050":
+            return "50°"
+        return "0°"
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        if not self.coordinator.device:
+            self._attr_current_option = None
+            super()._handle_coordinator_update()
+            return
+
+        self._attr_current_option = self._detect_tilt_mode()
+        super()._handle_coordinator_update()
+
+    async def async_select_option(self, option: str) -> None:
+        """Handle a tilt oscillation mode selection."""
+        if not self.coordinator.device:
+            return
+
+        try:
+            await self.coordinator.device.set_tilt_oscillation(option)
+
+            # Optimistic update for responsive UI
+            self._attr_current_option = option
+            self.async_write_ha_state()
+
+            _LOGGER.debug(
+                "Set tilt oscillation to '%s' for %s",
+                option,
+                self.coordinator.serial_number,
+            )
+        except (ConnectionError, TimeoutError) as err:
+            _LOGGER.error(
+                "Communication error setting tilt oscillation to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+        except ValueError as err:
+            _LOGGER.error(
+                "Invalid tilt oscillation option '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+        except Exception as err:
+            _LOGGER.error(
+                "Unexpected error setting tilt oscillation to '%s' for %s: %s",
+                option,
+                self.coordinator.serial_number,
+                err,
+            )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return tilt oscillation state attributes for scene support."""
+        if not self.coordinator.device:
+            return None
+
+        attributes: dict[str, Any] = {}
+        product_state = self.coordinator.data.get("product-state", {})
+
+        # Current tilt mode for scene support
+        attributes["tilt_mode"] = self._attr_current_option
+
+        # Raw oton value — ON means Breeze mode is active
+        oton = self.coordinator.device.get_state_value(product_state, "oton", "OFF")
+        attributes["tilt_oscillation_on"] = oton == "ON"
+
+        # Raw tilt angles (otal == otau in all observed traces)
+        try:
+            otal = self.coordinator.device.get_state_value(
+                product_state, "otal", "0000"
+            )
+            otau = self.coordinator.device.get_state_value(
+                product_state, "otau", "0000"
+            )
+            attributes["tilt_angle_lower"] = int(otal.lstrip("0") or "0")
+            attributes["tilt_angle_upper"] = int(otau.lstrip("0") or "0")
+        except (ValueError, TypeError):
+            pass
+
+        # Angle control preset (CUST or BRZE)
+        anct = self.coordinator.device.get_state_value(product_state, "anct", "CUST")
+        attributes["tilt_angle_control"] = anct
+
+        return attributes

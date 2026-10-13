@@ -1,0 +1,3763 @@
+"""Data update coordinator for Dyson devices and cloud accounts.
+
+This module provides coordinators for managing Dyson device state and cloud account
+operations. The coordinators handle MQTT communication, data synchronization,
+service registration, and device lifecycle management.
+
+Classes:
+    DysonDataUpdateCoordinator: Manages individual device state and communication
+    DysonCloudAccountCoordinator: Manages cloud account and device discovery
+
+Key Features:
+    - Real-time MQTT communication with devices
+    - Automatic device capability detection and service registration
+    - Connection failover (local → cloud → reconnection attempts)
+    - Environmental data streaming and caching
+    - Firmware update coordination
+    - Service lifecycle management based on device categories
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import re
+import time
+from contextlib import asynccontextmanager
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any, Final
+
+if TYPE_CHECKING:
+    from .ble_device import DysonBLEDevice
+
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryAuthFailed  # noqa: F401
+from homeassistant.helpers import instance_id as ha_instance_id, issue_registry as ir
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from libdyson_rest import AsyncDysonClient
+from libdyson_rest.exceptions import DysonAPIError, DysonAuthError, DysonConnectionError
+
+from .const import (
+    CONF_AUTO_ADD_DEVICES,
+    CONF_COUNTRY,
+    CONF_CREDENTIAL,
+    CONF_CULTURE,
+    CONF_DEVICE_NAME,
+    CONF_DHCP_HOST,
+    CONF_DISCOVERY_METHOD,
+    CONF_HOSTNAME,
+    CONF_MQTT_PREFIX,
+    CONF_POLL_FOR_DEVICES,
+    CONF_SERIAL_NUMBER,
+    DEFAULT_AUTO_ADD_DEVICES,
+    DEFAULT_CLOUD_POLLING_INTERVAL,
+    DEFAULT_DEVICE_POLLING_INTERVAL,
+    DEFAULT_POLL_FOR_DEVICES,
+    DISCOVERY_CLOUD,
+    DISCOVERY_MANUAL,
+    DISCOVERY_STICKER,
+    DOMAIN,
+    EVENT_DEVICE_FAULT,
+    MQTT_CMD_REQUEST_CURRENT_STATE,
+    MQTT_CMD_REQUEST_ENVIRONMENT,
+    UnsupportedDeviceError,
+)
+from .device import DysonDevice
+from .device_utils import mask_email, mask_serial
+
+_LOGGER = logging.getLogger(__name__)
+
+# How long a configured host may fail, with the cloud fallback in use, before
+# a repair issue is raised. Long enough to ride out a device reboot or a wifi
+# blip, short enough that a stale static address is noticed the same day.
+CONFIGURED_HOST_ISSUE_DELAY: Final = 600
+
+# Compiled regex patterns for culture/language normalisation (module-level for efficiency).
+_CULTURE_PATTERN = re.compile(r"^[a-z]{2}-[A-Z]{2}$")
+_EXTENDED_CULTURE_PATTERN = re.compile(r"^([a-z]{2})-[A-Za-z]+-([A-Z]{2})$")
+
+# Extracts the HTTP status code from a libdyson-rest error message.  httpx
+# renders status failures as "Client error '404 Not Found' for url '...'" /
+# "Server error '500 Internal Server Error' for url '...'", and DysonAPIError
+# wraps that text verbatim.  Anchoring on that shape — rather than matching any
+# 3-digit number — keeps digit groups in URLs or serial numbers from being
+# mistaken for HTTP statuses.  Used by async_discover_map_api_version.
+_HTTP_STATUS_RE = re.compile(r"\b(?:Client|Server) error '([45]\d{2})\b")
+
+
+# Sensitive config-entry field names that must be redacted from logs.
+# Token, password, secret, credential, key (case-insensitive substring match).
+_SENSITIVE_FIELD_SUBSTRINGS = ("token", "password", "secret", "credential", "key")
+
+
+def _redact_sensitive(data: Any) -> Any:
+    """Return a deep copy of *data* with sensitive fields redacted for logging.
+
+    Recursively redacts any mapping key whose lowercased name contains one of
+    _SENSITIVE_FIELD_SUBSTRINGS. Lists are processed element-wise. Accepts
+    any Mapping (HA's config_entry.data is a MappingProxyType, NOT a dict).
+    """
+    from collections.abc import Mapping  # local import keeps module top tidy
+
+    if isinstance(data, Mapping):
+        out: dict[str, Any] = {}
+        for k, v in data.items():
+            k_lower = str(k).lower()
+            if any(sub in k_lower for sub in _SENSITIVE_FIELD_SUBSTRINGS):
+                if v in (None, "", 0, False):
+                    out[k] = v
+                else:
+                    out[k] = f"<REDACTED {type(v).__name__}:{len(str(v))} chars>"
+            else:
+                out[k] = _redact_sensitive(v)
+        return out
+    if isinstance(data, list):
+        return [_redact_sensitive(item) for item in data]
+    return data
+
+
+def _get_default_country_culture_for_coordinator(hass) -> tuple[str, str]:
+    """Get default country and culture from Home Assistant configuration for coordinator.
+
+    Returns:
+        tuple: (country, culture) where:
+            - country: 2-letter uppercase ISO 3166-1 alpha-2 code
+            - culture: IETF language tag format (e.g., 'en-US')
+    """
+    # Handle test mocks that might not have config attribute
+    try:
+        hass_config = getattr(hass, "config", None)
+        if hass_config is None:
+            # Fallback for tests or cases where config is not available
+            return "US", "en-US"
+
+        # Get country from HA config, default to US if not set
+        ha_country = getattr(hass_config, "country", None) or "US"
+        country = ha_country.upper() if ha_country else "US"
+
+        # Get language from HA config, default to en if not set
+        ha_language = getattr(hass_config, "language", None) or "en"
+
+        # Normalize culture format to xx-YY (e.g., 'en-US', 'zh-CN')
+        # Replace underscores with hyphens (e.g., 'zh_CN' -> 'zh-CN')
+        ha_language = ha_language.replace("_", "-")
+
+        if _CULTURE_PATTERN.match(ha_language):
+            # Already in correct format (e.g., 'en-US')
+            culture = ha_language
+        elif extended_match := _EXTENDED_CULTURE_PATTERN.match(ha_language):
+            # Extended format like 'zh-Hans-CN' - extract language and country
+            language_code = extended_match.group(1)
+            country_code = extended_match.group(2)
+            culture = f"{language_code}-{country_code}"
+        elif len(ha_language) == 2:
+            # Just a language code (e.g., 'en'), combine with country
+            culture = f"{ha_language.lower()}-{country.upper()}"
+        elif len(ha_language) == 5 and "-" in ha_language:
+            # Has hyphen but wrong case, fix it
+            parts = ha_language.split("-")
+            culture = f"{parts[0].lower()}-{parts[1].upper()}"
+        else:
+            # Invalid format, use language code + country
+            lang_code = ha_language[:2].lower() if len(ha_language) >= 2 else "en"
+            culture = f"{lang_code}-{country.upper()}"
+
+        return country, culture
+    except (AttributeError, TypeError):
+        # Fallback for any unexpected issues (e.g., during testing)
+        return "US", "en-US"
+
+
+class TTLCache:
+    """Tiny in-process TTL cache keyed by string.
+
+    All entries share the same TTL; entries expire lazily on ``get()``.
+    """
+
+    def __init__(self, ttl_seconds: int) -> None:
+        """Initialise the cache with *ttl_seconds* time-to-live."""
+        self._ttl = ttl_seconds
+        self._store: dict[str, tuple[float, Any]] = {}
+
+    def get(self, key: str) -> Any | None:
+        """Return the cached value for *key*, or ``None`` if absent/expired."""
+        cached = self._store.get(key)
+        if cached is None:
+            return None
+        if (time.monotonic() - cached[0]) >= self._ttl:
+            return None
+        return cached[1]
+
+    def set(self, key: str, value: Any) -> None:
+        """Store *value* under *key*, resetting the TTL."""
+        self._store[key] = (time.monotonic(), value)
+
+    def expire(self, key: str) -> None:
+        """Force *key* to miss on the next :meth:`get` without removing it.
+
+        The entry is still accessible via :meth:`get_stale` so it can be used
+        as a fallback when a subsequent live fetch fails.
+        """
+        cached = self._store.get(key)
+        if cached is not None:
+            # Use float('-inf') so that time.monotonic() - float('-inf') == inf,
+            # which is always >= any TTL regardless of how long the process has
+            # been running (avoids failures in fresh CI environments where
+            # time.monotonic() may be less than the cache TTL in seconds).
+            self._store[key] = (float("-inf"), cached[1])
+
+    def get_stale(self, key: str) -> Any | None:
+        """Return the cached value regardless of TTL (use only as a fallback)."""
+        cached = self._store.get(key)
+        return cached[1] if cached else None
+
+    def invalidate(self, key: str) -> None:
+        """Remove *key* from the cache."""
+        self._store.pop(key, None)
+
+    def invalidate_prefix(self, prefix: str) -> None:
+        """Remove every key that starts with *prefix* from the cache."""
+        for key in [k for k in self._store if k.startswith(prefix)]:
+            self._store.pop(key, None)
+
+    def expire_prefix(self, prefix: str) -> None:
+        """Expire every key that starts with *prefix* (see :meth:`expire`).
+
+        Unlike :meth:`invalidate_prefix` the values stay available through
+        :meth:`get_stale`, so callers with a stale-fallback path keep working
+        if the refetch after expiry fails.
+        """
+        for key in [k for k in self._store if k.startswith(prefix)]:
+            self.expire(key)
+
+
+class DysonDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Coordinator for managing individual Dyson device state and communication.
+
+    This coordinator handles all aspects of device communication including MQTT
+    connection management, data synchronization, service registration, and
+    device lifecycle management.
+
+    Attributes:
+        device: DysonDevice wrapper for MQTT communication
+        serial_number: Unique device identifier
+        device_capabilities: List of device capabilities (WiFi, ExtendedAQ, etc.)
+        device_category: List of device categories (FAN, SENSOR, etc.)
+        device_type: Device type identifier from product info
+        firmware_version: Current device firmware version
+        firmware_auto_update_enabled: Whether auto-updates are enabled
+        firmware_latest_version: Latest available firmware version
+        firmware_update_in_progress: Whether update is currently running
+
+    Example:
+        Creating and using a device coordinator:
+
+        >>> coordinator = DysonDataUpdateCoordinator(
+        >>>     hass=hass,
+        >>>     config_entry=config_entry
+        >>> )
+        >>> await coordinator.async_config_entry_first_refresh()
+        >>>
+        >>> # Access device state
+        >>> if coordinator.device:
+        >>>     pm25 = coordinator.device.pm25
+        >>>     fan_speed = coordinator.device.fan_speed
+        >>>
+        >>> # Check capabilities
+        >>> if "ExtendedAQ" in coordinator.device_capabilities:
+        >>>     voc_level = coordinator.device.voc
+
+    Note:
+        The coordinator automatically manages connection failover, attempting
+        local connection first, then cloud fallback if configured.
+
+        Service registration is capability-driven and happens automatically
+        when device capabilities are detected.
+
+        Environmental data is streamed in real-time via MQTT callbacks,
+        providing immediate updates to sensor entities.
+    """
+
+    def __init__(self, hass: HomeAssistant, config_entry) -> None:  # type: ignore
+        """Initialize the coordinator."""
+        self.config_entry = config_entry
+        # Cache serial number to avoid repeated config-entry dict lookups and
+        # debug log spam on every property access.
+        self._serial_number: str = config_entry.data.get(
+            CONF_SERIAL_NUMBER
+        ) or config_entry.data.get("device_serial_number", "unknown")
+        self.device: DysonDevice | None = None
+        self._local_fallback_since: float | None = None
+        self._device_capabilities: list[str] = []
+        self._device_category: list[str] = []
+        self._device_type: str = ""  # Will be extracted from device info
+        self._map_api_version: int | None = (
+            None  # Discovered lazily via async_discover_map_api_version
+        )
+        self._firmware_version: str = "Unknown"
+        self._firmware_auto_update_enabled: bool = False
+        self._services_registered: bool = False
+        self._firmware_latest_version: str | None = None
+        self._firmware_update_in_progress: bool = False
+
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"{DOMAIN}_{self._serial_number}",
+            update_interval=timedelta(seconds=DEFAULT_DEVICE_POLLING_INTERVAL),
+        )
+
+    @property
+    def device_capabilities(self) -> list[str]:
+        """Return detected device capabilities.
+
+        Returns:
+            List of capability strings that determine available features:
+            - "WiFi": Device supports wireless connectivity
+            - "ExtendedAQ": Advanced air quality sensors (VOC, FORMALDEHYDE)
+            - "AirQuality": Basic air quality sensors (PM2.5, PM10)
+            - "Night": Night mode functionality
+            - "Oscillation": Fan oscillation control
+            - "Heat": Heating functionality
+            - "Cool": Cooling functionality
+            - "Humidify": Humidification capability
+            - "WakeupFunnel": Advanced wake-up air delivery
+
+        Example:
+            Check for extended air quality features:
+
+            >>> if "ExtendedAQ" in coordinator.device_capabilities:
+            >>>     # VOC and formaldehyde sensors available
+            >>>     voc_level = coordinator.device.voc
+            >>>     formaldehyde = coordinator.device.formaldehyde
+        """
+        return self._device_capabilities
+
+    @property
+    def device_category(self) -> list[str]:
+        """Return device category classifications.
+
+        Returns:
+            List of category strings that define device type and services:
+            - "FAN": Air circulation and filtration device
+            - "HEATER": Heating functionality available
+            - "COOLER": Cooling functionality available
+            - "PURIFIER": Air purification capability
+            - "HUMIDIFIER": Humidity control
+            - "SENSOR": Environmental monitoring
+            - "LIGHTING": Built-in lighting controls
+
+        Note:
+            Categories determine which Home Assistant services are registered.
+            Multiple categories indicate multi-functional devices.
+
+        Example:
+            Check device capabilities:
+
+            >>> if "FAN" in coordinator.device_category:
+            >>>     # Fan controls available
+            >>>     await coordinator.device.set_fan_speed(5)
+            >>> if "SENSOR" in coordinator.device_category:
+            >>>     # Environmental data available
+            >>>     temperature = coordinator.device.temperature
+        """
+        return self._device_category
+
+    @property
+    def device_type(self) -> str:
+        """Return device type identifier.
+
+        Returns:
+            Device type string extracted from product information, such as:
+            - "438": Pure Cool (Tower fan with purification)
+            - "455": Pure Cool Link (Connected tower fan)
+            - "358": Pure Hot+Cool (Heater/cooler/purifier)
+            - "527": Pure Cool Me (Personal air purifier)
+            - "520": Pure Humidity+Cool (Humidifier with cooling)
+
+        Note:
+            Used for device identification and capability inference.
+            Different device types support different feature sets.
+
+        Example:
+            Check device type for features:
+
+            >>> if coordinator.device_type in ["358", "455"]:
+            >>>     # Hot+Cool models support heating
+            >>>     heating_available = True
+        """
+        return self._device_type
+
+    async def async_discover_map_api_version(self, client) -> int:  # type: ignore[override]
+        """Probe and cache the map-endpoint API version for this device.
+
+        Calls ``get_clean_maps`` with ``api_version=1`` as a lightweight probe
+        (dust maps excluded so no large payloads are transferred).
+
+        Outcomes:
+
+        - Probe succeeds → the device is served by the v1 endpoints
+          (360 Vis Nav); ``1`` is cached.
+        - Probe fails with a definitive HTTP 4xx → the device is not served
+          by the v1 endpoints (360 Spot+Clean / Spot+Scrub and newer);
+          ``2`` is cached.
+        - Probe fails with an HTTP 5xx → ambiguous: a v2-only device sees
+          this, but so does a Vis Nav during a transient cloud incident.
+          ``2`` is returned for this call but NOT cached, so a Vis Nav is
+          not locked onto v2 endpoints (which fail for it) until the next
+          restart — the probe re-runs on the next map call and recovers
+          together with the cloud.
+        - Auth or non-HTTP errors → ``1`` is returned without caching and
+          the caller surfaces the underlying failure.
+
+        Once a result is cached, subsequent calls return it immediately
+        without any network request.
+
+        Args:
+            client: An authenticated ``AsyncDysonClient`` instance.
+
+        Returns:
+            ``1`` for v1-served devices (360 Vis Nav), ``2`` for v2-served
+            devices (360 Spot+Clean / Spot+Scrub and newer).
+        """
+        if self._map_api_version is not None:
+            return self._map_api_version
+
+        try:
+            await client.get_clean_maps(
+                self.serial_number,
+                api_version=1,
+                include_dust_map=False,
+            )
+            self._map_api_version = 1
+            _LOGGER.debug(
+                "Map API version for %s: v1 (probe succeeded)",
+                self.serial_number,
+            )
+        except DysonAuthError:
+            # Auth failure is not version-related; do not cache, return v1
+            # as a best-guess and let the caller surface the auth error.
+            _LOGGER.debug(
+                "Map API version probe for %s: auth error — defaulting to v1",
+                self.serial_number,
+            )
+            return 1
+        except DysonAPIError as err:
+            err_str = str(err)
+            status_match = _HTTP_STATUS_RE.search(err_str)
+            if status_match is None:
+                # Non-HTTP error (connection failure, unexpected response
+                # shape, etc.); do not cache so the next call retries the
+                # probe.
+                _LOGGER.warning(
+                    "Map API version probe for %s: unexpected error '%s'"
+                    " — defaulting to v1 for this call",
+                    self.serial_number,
+                    err_str,
+                )
+                return 1
+            status = int(status_match.group(1))
+            if status >= 500:
+                # Ambiguous: a v2-only device sees a 5xx on v1, but so does
+                # a Vis Nav during a transient cloud incident.  Use v2 for
+                # this call without caching; callers fall back to their
+                # stale TTL caches if v2 then fails, and the next map call
+                # re-probes.
+                _LOGGER.warning(
+                    "Map API version probe for %s: v1 endpoint returned"
+                    " HTTP %d — using v2 for this call without caching",
+                    self.serial_number,
+                    status,
+                )
+                return 2
+            self._map_api_version = 2
+            _LOGGER.info(
+                "Map API version for %s: v2 (v1 probe returned HTTP %d"
+                " — device uses v2 endpoints)",
+                self.serial_number,
+                status,
+            )
+
+        return self._map_api_version
+
+    @property
+    def firmware_version(self) -> str:
+        """Return current device firmware version.
+
+        Returns:
+            Firmware version string in format "XX.YY.ZZ" or "Unknown" if
+            version cannot be determined from device state.
+
+        Example:
+            Check firmware version:
+
+            >>> current_fw = coordinator.firmware_version
+            >>> if current_fw != "Unknown":
+            >>>     _LOGGER.info(f"Device firmware: {current_fw}")
+        """
+        return self._firmware_version
+
+    @property
+    def firmware_auto_update_enabled(self) -> bool:
+        """Return whether automatic firmware updates are enabled.
+
+        Returns:
+            True if device is configured to automatically download and install
+            firmware updates, False otherwise.
+
+        Note:
+            This setting is managed through the Dyson Link app and affects
+            whether the device will automatically update its firmware when
+            new versions are available.
+
+        Example:
+            Check auto-update status:
+
+            >>> if coordinator.firmware_auto_update_enabled:
+            >>>     _LOGGER.info("Device will auto-update firmware")
+            >>> else:
+            >>>     _LOGGER.info("Manual firmware updates required")
+        """
+        return self._firmware_auto_update_enabled
+
+    @property
+    def firmware_latest_version(self) -> str | None:
+        """Return the latest available firmware version from Dyson servers.
+
+        Returns:
+            Latest firmware version string if available from cloud API,
+            None if version information is not available or cannot be retrieved.
+
+        Note:
+            This information is fetched from Dyson's cloud service during
+            coordinator updates. May be None if cloud connectivity is unavailable
+            or if the device doesn't support cloud-based update checking.
+
+        Example:
+            Compare current vs latest firmware:
+
+            >>> current = coordinator.firmware_version
+            >>> latest = coordinator.firmware_latest_version
+            >>> if latest and latest != current:
+            >>>     _LOGGER.info(f"Firmware update available: {current} -> {latest}")
+        """
+        return self._firmware_latest_version
+
+    @property
+    def firmware_update_in_progress(self) -> bool:
+        """Return whether a firmware update is currently in progress.
+
+        Returns:
+            True if a firmware update is currently being downloaded or installed,
+            False if no update is active.
+
+        Note:
+            Status is managed through multiple channels:
+            1. Set to True when cloud API firmware update is triggered
+            2. Updated via MQTT messages on /status/software topic (when available)
+            3. Set to False when update completes successfully or fails
+
+            During updates, device functionality may be limited and the device
+            may temporarily disconnect from network or MQTT.
+
+        Example:
+            Check for active firmware update:
+
+            >>> if coordinator.firmware_update_in_progress:
+            >>>     _LOGGER.info("Firmware update in progress - device may be unavailable")
+            >>>     # Avoid sending commands during update
+            >>> else:
+            >>>     # Safe to send device commands
+            >>>     await coordinator.device.set_fan_speed(5)
+        """
+        return self._firmware_update_in_progress
+
+    async def ensure_device_services_registered(self) -> None:
+        """Ensure device services are registered when capabilities become available.
+
+        This method dynamically registers Home Assistant services based on detected
+        device capabilities and categories. Services are registered only once when
+        capabilities are first detected to avoid duplicate registrations.
+
+        Registered services include:
+            - Fan control (speed, oscillation, night mode)
+            - Temperature control (heating/cooling targets)
+            - Timer operations (sleep timer, auto-off)
+            - Maintenance (filter reset, device reset)
+            - Air quality (auto mode, sensitivity settings)
+
+        Note:
+            Called automatically during device initialization and capability updates.
+            Services are capability-driven - only relevant services are registered
+            based on what the device actually supports.
+
+        Raises:
+            Exception: If service registration fails (logged but not propagated)
+
+        Example:
+            Services are registered automatically, but can be triggered manually:
+
+            >>> # Usually not needed - called automatically
+            >>> await coordinator.ensure_device_services_registered()
+            >>>
+            >>> # Check if services are registered
+            >>> if coordinator._services_registered:
+            >>>     # Services available for use
+            >>>     pass
+        """
+        if not self._services_registered and (
+            self._device_capabilities
+            or (self.device and getattr(self.device, "capabilities", []))
+        ):
+            from .services import async_register_device_services_for_coordinator
+
+            try:
+                await async_register_device_services_for_coordinator(self.hass, self)
+                self._services_registered = True
+                _LOGGER.debug(
+                    "Re-registered device services for %s with capabilities: %s",
+                    self.serial_number,
+                    self._device_capabilities
+                    or getattr(self.device, "capabilities", []),
+                )
+            except Exception as err:
+                _LOGGER.warning(
+                    "Failed to re-register device services for %s: %s",
+                    self.serial_number,
+                    err,
+                )
+
+    def _on_environmental_update(self) -> None:
+        """Handle environmental data update from device."""
+        _LOGGER.debug(
+            "Received environmental update notification for %s - updating sensors",
+            self.serial_number,
+        )
+
+        # Log current environmental data state for debugging
+        if self.device and hasattr(self.device, "_environmental_data"):
+            env_data = self.device.get_environmental_data()
+            _LOGGER.debug(
+                "Environmental data at callback time for %s: pm25=%s, pm10=%s",
+                self.serial_number,
+                env_data.get("pm25"),
+                env_data.get("pm10"),
+            )
+
+        # Schedule the async update using proper coordinator method to notify entities
+        self.hass.add_job(self._notify_ha_of_state_change)
+
+    async def _notify_ha_of_state_change(self) -> None:
+        """Notify Home Assistant framework of state changes via MQTT."""
+        try:
+            if self.device:
+                fresh_state = await self.device.get_state()
+                _LOGGER.debug(
+                    "Updated coordinator data via MQTT callback, notifying HA framework"
+                )
+                self.async_set_updated_data(fresh_state)
+            else:
+                _LOGGER.debug("No device available for coordinator data update")
+        except Exception as e:
+            _LOGGER.warning("Error updating coordinator data: %s", e)
+
+    def _on_message_update(self, topic: str, data: dict[str, Any]) -> None:
+        """Handle message updates from device for real-time state changes."""
+        _LOGGER.debug(
+            "Received message update for %s on topic %s", self.serial_number, topic
+        )
+
+        # Handle firmware update progress messages on /status/software topic
+        if topic.endswith("/status/software"):
+            _LOGGER.debug("Received firmware update status message: %s", data)
+            self._handle_firmware_update_status(topic, data)
+            return
+
+        # Update entity states for STATE-CHANGE, CURRENT-STATE, ENVIRONMENTAL-CURRENT-SENSOR-DATA, and CURRENT-FAULTS messages
+        message_type = data.get("msg", "")
+        if message_type == "STATE-CHANGE":
+            _LOGGER.debug(
+                "Processing STATE-CHANGE message for real-time entity updates"
+            )
+            self._handle_state_change_message()
+        elif message_type == "CURRENT-STATE":
+            _LOGGER.debug(
+                "Processing CURRENT-STATE message for real-time entity updates"
+            )
+            # CURRENT-STATE messages should also trigger coordinator updates
+            # This handles responses from REQUEST-CURRENT-STATE (like timer polling)
+            self._handle_state_change_message()
+        elif message_type == "ENVIRONMENTAL-CURRENT-SENSOR-DATA":
+            _LOGGER.debug(
+                "Processing ENVIRONMENTAL-CURRENT-SENSOR-DATA message for real-time entity updates"
+            )
+            # For environmental data, update coordinator data directly from the message
+            # No need for additional device calls since we have the data
+            self._handle_environmental_message(data)
+        elif message_type == "CURRENT-FAULTS":
+            _LOGGER.debug(
+                "Processing CURRENT-FAULTS message for real-time entity updates"
+            )
+            # CURRENT-FAULTS messages should trigger coordinator updates
+            # This ensures binary sensors and other fault-dependent entities are notified
+            self._handle_state_change_message()
+
+    def _handle_environmental_message(self, data: dict[str, Any]) -> None:
+        """Handle ENVIRONMENTAL-CURRENT-SENSOR-DATA message directly."""
+        try:
+            env_data = data.get("data", {})
+            if not env_data:
+                _LOGGER.debug("No environmental data in message")
+                return
+
+            _LOGGER.debug(
+                "Updating coordinator with environmental data: %s",
+                list(env_data.keys()),
+            )
+
+            # Update coordinator data with environmental information
+            if not self.data:
+                self.data = {}
+            if "environmental-data" not in self.data:
+                self.data["environmental-data"] = {}
+
+            # Update the environmental data in coordinator
+            self.data["environmental-data"].update(env_data)
+
+            # Notify Home Assistant of the update with the fresh environmental data
+            # This ensures entities see the latest environmental data immediately
+            self.hass.loop.call_soon_threadsafe(
+                lambda: self.async_set_updated_data(self.data)
+            )
+
+        except Exception as e:
+            _LOGGER.warning("Error handling environmental message: %s", e)
+
+    def _handle_firmware_update_status(self, topic: str, data: dict[str, Any]) -> None:
+        """Handle firmware update status messages from /status/software topic.
+
+        TODO: Implement once the JSON key for status values is identified.
+
+        Known status values to handle:
+        - "acknowledged": Download started - keep _firmware_update_in_progress = True
+        - "downloaded": Installation started - keep _firmware_update_in_progress = True
+        - Unknown completion/success value - set _firmware_update_in_progress = False
+        - Unknown failure value - set _firmware_update_in_progress = False
+
+        Expected message structure (key unknown):
+        {
+            "unknown_key": "acknowledged"|"downloaded"|"completed"|"failed"|...,
+            ... other fields ...
+        }
+        """
+        try:
+            _LOGGER.info(
+                "Firmware update status received for %s: %s", self.serial_number, data
+            )
+
+            # TODO: Extract status value once key is identified
+            # status_value = data.get("unknown_key")
+            #
+            # if status_value in ["acknowledged", "downloaded"]:
+            #     # Update is in progress (downloading or installing)
+            #     self._firmware_update_in_progress = True
+            #     _LOGGER.info("Firmware update in progress: %s", status_value)
+            # elif status_value in ["completed", "success"]:  # TBD actual values
+            #     # Update completed successfully
+            #     self._firmware_update_in_progress = False
+            #     _LOGGER.info("Firmware update completed successfully")
+            # elif status_value in ["failed", "error"]:  # TBD actual values
+            #     # Update failed
+            #     self._firmware_update_in_progress = False
+            #     _LOGGER.error("Firmware update failed: %s", status_value)
+            #
+            # # Notify entities of status change
+            # self.async_update_listeners()
+
+        except Exception as e:
+            _LOGGER.error(
+                "Error handling firmware update status for %s: %s",
+                self.serial_number,
+                e,
+            )
+
+    def _handle_state_change_message(self) -> None:
+        """Handle STATE-CHANGE message updates."""
+        try:
+            if self.device:
+                self._schedule_coordinator_data_update()
+            else:
+                self._schedule_listener_update()
+        except Exception as e:
+            _LOGGER.warning("Error setting up STATE-CHANGE data update: %s", e)
+            self._schedule_fallback_update()
+
+    def _schedule_coordinator_data_update(self) -> None:
+        """Schedule coordinator data update with fresh device state."""
+        self.hass.loop.call_soon_threadsafe(self._create_coordinator_update_task)
+
+    def _create_coordinator_update_task(self) -> None:
+        """Create the async update task."""
+        self.hass.async_create_task(self._update_coordinator_data())
+
+    async def _update_coordinator_data(self) -> None:
+        """Update coordinator data in the event loop."""
+        try:
+            if not self.device:
+                _LOGGER.warning("No device available for coordinator data update")
+                return
+
+            fresh_state = await self.device.get_state()
+            self.data = fresh_state
+            _LOGGER.debug(
+                "Updated coordinator data for message update, triggering listeners via async_set_updated_data"
+            )
+            # Use async_set_updated_data to properly notify Home Assistant framework
+            self.async_set_updated_data(fresh_state)
+        except Exception as e:
+            _LOGGER.warning("Error getting fresh state for STATE-CHANGE: %s", e)
+            # Still notify even if data update failed
+            self.async_update_listeners()
+
+    def _schedule_listener_update(self) -> None:
+        """Schedule async listener update when no device is available."""
+        self.hass.loop.call_soon_threadsafe(self._notify_ha_via_loop)
+
+    def _schedule_fallback_update(self) -> None:
+        """Schedule fallback listener update in case of errors."""
+        try:
+            self.hass.loop.call_soon_threadsafe(self._notify_ha_via_loop)
+        except Exception as fallback_e:
+            _LOGGER.warning("Failed to schedule fallback update: %s", fallback_e)
+
+    def _notify_ha_via_loop(self) -> None:
+        """Notify HA from loop thread."""
+        self.hass.add_job(self._notify_ha_of_state_change)
+
+    @property
+    def serial_number(self) -> str:
+        """Return device serial number (cached at init, with fallback for test stubs)."""
+        sn = getattr(self, "_serial_number", None)
+        if sn:
+            return sn
+        return self.config_entry.data.get(
+            CONF_SERIAL_NUMBER
+        ) or self.config_entry.data.get("device_serial_number", "unknown")
+
+    @property
+    def device_name(self) -> str:
+        """Return device friendly name."""
+        # Get device name from config entry data
+        device_name = self.config_entry.data.get(CONF_DEVICE_NAME)
+        if device_name:
+            return device_name
+
+        # Fallback to "Dyson [serial]" if no device name provided
+        return f"Dyson {self.serial_number}"
+
+    def _get_effective_connection_type(self) -> str:
+        """Get the effective connection type for this device."""
+        # Check if device has its own connection type override
+        device_connection_type = self.config_entry.data.get("connection_type")
+        if device_connection_type:
+            _LOGGER.debug(
+                "Using device-specific connection type: %s", device_connection_type
+            )
+            return device_connection_type
+
+        # Fall back to account-level connection type
+        parent_entry_id = self.config_entry.data.get("parent_entry_id")
+        if parent_entry_id:
+            # This is a device entry, get connection type from parent account entry
+            try:
+                account_entries = [
+                    entry
+                    for entry in self.hass.config_entries.async_entries(DOMAIN)
+                    if entry.entry_id == parent_entry_id
+                ]
+
+                if account_entries:
+                    account_connection_type = account_entries[0].data.get(
+                        "connection_type", "local_cloud_fallback"
+                    )
+                    _LOGGER.debug(
+                        "Using account-level connection type: %s",
+                        account_connection_type,
+                    )
+                    return account_connection_type
+            except Exception as err:
+                _LOGGER.warning("Failed to get account connection type: %s", err)
+
+        # Default fallback
+        default_type = "local_cloud_fallback"
+        _LOGGER.debug("Using default connection type: %s", default_type)
+        return default_type
+
+    async def async_config_entry_first_refresh(self) -> None:
+        """Perform first refresh and device setup."""
+        _LOGGER.debug(
+            "Performing first refresh for device %s", mask_serial(self.serial_number)
+        )
+
+        try:
+            # Initialize device connection
+            await self._async_setup_device()
+
+            # Perform initial data fetch
+            await super().async_config_entry_first_refresh()
+
+        except UnsupportedDeviceError:
+            # Re-raise without logging - this is expected behavior for non-MQTT devices
+            # Already logged at INFO level in _async_setup_cloud_device()
+            raise
+        except Exception as err:
+            _LOGGER.error(
+                "Failed to setup device %s: %s", mask_serial(self.serial_number), err
+            )
+            raise
+
+    async def _async_setup_device(self) -> None:
+        """Set up the Dyson device connection."""
+        discovery_method = self.config_entry.data.get(
+            CONF_DISCOVERY_METHOD, DISCOVERY_CLOUD
+        )
+
+        if discovery_method == DISCOVERY_CLOUD:
+            await self._async_setup_cloud_device()
+        elif discovery_method == DISCOVERY_STICKER:
+            # TODO: Update sticker method to use paho-mqtt directly
+            raise UpdateFailed(
+                "Sticker discovery method temporarily disabled - use cloud discovery instead"
+            )
+            # await self._async_setup_sticker_device()
+        elif discovery_method == DISCOVERY_MANUAL:
+            await self._async_setup_manual_device()
+        else:
+            raise UpdateFailed(f"Unknown discovery method: {discovery_method}")
+
+    async def _async_setup_cloud_device(self) -> None:
+        """Set up device discovered via cloud API."""
+        _LOGGER.debug("Setting up cloud device for %s", mask_serial(self.serial_number))
+
+        try:
+            cloud_client = await self._authenticate_cloud_client()
+            device_info = await self._find_cloud_device(cloud_client)
+
+            # Check if device has MQTT support BEFORE extracting device info
+            # to avoid unnecessary API calls for unsupported devices
+            if not self._device_has_mqtt_support(device_info):
+                connection_category = getattr(
+                    device_info, "connection_category", "unknown"
+                )
+                _LOGGER.info(
+                    "Device %s (%s) does not have MQTT support (connectivity: %s). "
+                    "This device will be automatically removed from Home Assistant.",
+                    self.serial_number,
+                    getattr(device_info, "name", "Unknown"),
+                    connection_category,
+                )
+                raise UnsupportedDeviceError(
+                    f"Device {self.serial_number} does not support MQTT connection"
+                )
+
+            # Only extract device info for MQTT-supported devices
+            self._extract_device_info(device_info)
+
+            mqtt_credentials = await self._extract_mqtt_credentials(
+                cloud_client, device_info
+            )
+            cloud_credentials = await self._extract_cloud_credentials(
+                cloud_client, device_info
+            )
+            await self._create_cloud_device(
+                device_info, mqtt_credentials, cloud_credentials
+            )
+
+            _LOGGER.info(
+                "Successfully set up cloud device %s (%s)",
+                self.serial_number,
+                self._device_category,
+            )
+
+        except UnsupportedDeviceError:
+            # Let UnsupportedDeviceError propagate unchanged for automatic removal
+            raise
+        except Exception as err:
+            _LOGGER.error(
+                "Failed to set up cloud device %s: %s", self.serial_number, err
+            )
+            raise UpdateFailed(f"Cloud device setup failed: {err}") from err
+
+    async def _authenticate_cloud_client(self):
+        """Authenticate and return a cloud client."""
+        auth_token = self.config_entry.data.get("auth_token")
+        # Get credential (email or phone number) from config entry
+        credential = self.config_entry.data.get("email")
+        password = self.config_entry.data.get("password")
+
+        _LOGGER.debug(
+            "Cloud authentication for %s - credential: %s, auth_token: %s",
+            mask_serial(self.serial_number),
+            mask_email(credential) if credential else "None",
+            "***" if auth_token else "None",
+        )
+
+        # Initialize cloud client
+        if auth_token:
+            # Use existing auth token from config flow (in executor to avoid blocking SSL calls)
+            # Get country and culture from config entry for CN API support
+            country = self.config_entry.data.get(CONF_COUNTRY, "US")
+            culture = self.config_entry.data.get(CONF_CULTURE, "en-US")
+
+            _LOGGER.debug(
+                "Authenticating with token for %s - country: %s, culture: %s, credential: %s",
+                mask_serial(self.serial_number),
+                country,
+                culture,
+                credential,
+            )
+
+            return AsyncDysonClient(
+                email=credential,
+                auth_token=auth_token,
+                country=country,
+                culture=culture,
+            )
+        elif credential and password:
+            # Legacy authentication method - follow same pattern as config_flow
+            # Get country and culture from HA config
+            country, culture = _get_default_country_culture_for_coordinator(self.hass)
+
+            _LOGGER.debug(
+                "Authenticating with password for %s - country: %s, culture: %s",
+                self.serial_number,
+                country,
+                culture,
+            )
+
+            cloud_client = AsyncDysonClient(
+                email=credential,
+                password=password,
+                country=country,
+                culture=culture,
+            )
+
+            # Follow the same authentication sequence as the working script
+            try:
+                # Step 1: Provision API access
+                await cloud_client.provision()
+                _LOGGER.debug("API provisioned for device %s", self.serial_number)
+
+                # Step 2: Check user status
+                user_status = await cloud_client.get_user_status()
+                _LOGGER.debug(
+                    "Account status for device %s: %s",
+                    self.serial_number,
+                    user_status.account_status.value,
+                )
+
+                # Step 3: Authenticate using proper flow
+                challenge = await cloud_client.begin_login()
+                await cloud_client.complete_login(
+                    str(challenge.challenge_id), "", credential, password
+                )
+                return cloud_client
+            except Exception as e:
+                await cloud_client.close()
+                raise UpdateFailed(
+                    f"Cloud authentication failed for {self.serial_number}: {e}"
+                ) from e
+        else:
+            raise UpdateFailed(
+                "Missing cloud credentials (auth_token or email/password)"
+            )
+
+    @asynccontextmanager
+    async def async_cloud_client(self):
+        """Async context manager yielding an authenticated ``AsyncDysonClient``.
+
+        Wraps :meth:`_authenticate_cloud_client` with proper close handling so
+        callers don't need to manage client lifecycle.  Yields ``None`` when no
+        ``auth_token`` is available so callers can fall back gracefully.
+
+        Example::
+
+            async with self.coordinator.async_cloud_client() as client:
+                if client is None:
+                    return  # no credentials
+                data = await client.some_method(self.coordinator.serial_number)
+        """
+        if not self.config_entry.data.get("auth_token"):
+            _LOGGER.debug(
+                "No auth_token for %s — skipping REST call",
+                getattr(self, "serial_number", "unknown"),
+            )
+            yield None
+            return
+
+        client = await self._authenticate_cloud_client()
+        try:
+            yield client
+        finally:
+            await client.close()
+
+    async def _find_cloud_device(self, cloud_client):
+        """Find our device in the cloud device list."""
+        devices = await cloud_client.get_devices()
+
+        for device in devices:
+            if device.serial_number == self.serial_number:
+                return device
+
+        raise UpdateFailed(f"Device {self.serial_number} not found in cloud account")
+
+    def _extract_device_info(self, device_info) -> None:
+        """Extract device category and capabilities from device info."""
+        _LOGGER.debug(
+            "Extracting device info for %s (model=%s)",
+            mask_serial(str(getattr(device_info, "serial_number", "unknown"))),
+            getattr(device_info, "model", "unknown"),
+        )
+        self._debug_connected_configuration(device_info)
+        self._extract_device_type(device_info)
+        self._extract_device_category(device_info)
+        self._extract_device_capabilities(device_info)
+        self._extract_firmware_version(device_info)
+
+    def _debug_connected_configuration(self, device_info) -> None:
+        """Log debug information about the device's connected configuration."""
+        connected_config = getattr(device_info, "connected_configuration", None)
+        if connected_config is None:
+            _LOGGER.debug(
+                "No connected_configuration for %s",
+                getattr(self, "serial_number", "unknown"),
+            )
+            return
+        _LOGGER.debug(
+            "Connected configuration for %s: %s",
+            getattr(self, "serial_number", "unknown"),
+            connected_config,
+        )
+        self._debug_mqtt_object(connected_config)
+
+    def _debug_mqtt_object(self, connected_config) -> None:
+        """Log debug information about the MQTT configuration, masking the password."""
+        mqtt_obj = getattr(connected_config, "mqtt", None)
+        if mqtt_obj is None:
+            _LOGGER.debug("No MQTT object in connected configuration")
+            return
+        # Mask the password field for safe logging
+        password = getattr(mqtt_obj, "password", None)
+        masked = "***" if password else None
+        _LOGGER.debug(
+            "MQTT config: %s (password=%s)",
+            {k: v for k, v in vars(mqtt_obj).items() if k != "password"}
+            if hasattr(mqtt_obj, "__dict__")
+            else mqtt_obj,
+            masked,
+        )
+
+    def _extract_device_type(self, device_info) -> None:
+        """Extract device type from device info."""
+        # Extract device type from device_info using both possible field names
+        device_type = getattr(device_info, "product_type", None)
+        if device_type is None:
+            device_type = getattr(device_info, "type", None)
+
+        if device_type is None:
+            raise ValueError(
+                f"Device type not available for device {self.serial_number}"
+            )
+
+        self._device_type = str(device_type)
+        _LOGGER.debug("Extracted device type: %s", self._device_type)
+
+    def _extract_device_category(self, device_info) -> None:
+        """Extract device category from config entry or API response."""
+        from .device_utils import normalize_device_category
+
+        # Check if device_category was provided in config entry (like manual devices)
+        config_device_category = self.config_entry.data.get("device_category")
+        if config_device_category:
+            # Use device_category from config entry if available (ensures consistency)
+            self._device_category = normalize_device_category(config_device_category)
+            _LOGGER.debug(
+                "Using device category from config entry: %s", self._device_category
+            )
+        else:
+            # Extract category from API response
+            raw_category = getattr(device_info, "category", "unknown")
+            self._device_category = normalize_device_category(raw_category)
+            _LOGGER.debug(
+                "Extracted device category from API: %s", self._device_category
+            )
+
+    def _extract_device_capabilities(self, device_info) -> None:
+        """Extract device capabilities from config entry or API response."""
+        from .device_utils import normalize_capabilities
+
+        try:
+            # Extract capabilities from config entry or API
+            config_capabilities = self.config_entry.data.get("capabilities")
+
+            if config_capabilities and len(config_capabilities) > 0:
+                # Use capabilities from config entry if non-empty (prioritize config entry for cloud devices)
+                self._device_capabilities = normalize_capabilities(config_capabilities)
+                _LOGGER.debug(
+                    "Using capabilities from config entry for %s: %s",
+                    self.serial_number,
+                    self._device_capabilities,
+                )
+
+                # Validate that we got meaningful capabilities
+                if not self._device_capabilities:
+                    _LOGGER.warning(
+                        "Config capabilities for %s resulted in empty list after normalization: %s",
+                        self.serial_number,
+                        config_capabilities,
+                    )
+                    # Fall back to API extraction if config normalization failed
+                    self._extract_from_api_fallback(device_info)
+            else:
+                # Extract capabilities from API response (fallback for older entries or missing data)
+                self._extract_from_api_fallback(device_info)
+
+        except Exception as e:
+            _LOGGER.error(
+                "Critical error during capability extraction for %s: %s",
+                self.serial_number,
+                e,
+            )
+            # Fallback to empty capabilities to prevent integration failure
+            self._device_capabilities = []
+
+        # Log final capability state for debugging
+        _LOGGER.info(
+            "Final capabilities for device %s: %s",
+            mask_serial(self.serial_number),
+            self._device_capabilities,
+        )
+
+    def _extract_from_api_fallback(self, device_info) -> None:
+        """Extract capabilities from API response as fallback."""
+        try:
+            api_capabilities = self._extract_capabilities(device_info)
+            from .device_utils import normalize_capabilities
+
+            self._device_capabilities = normalize_capabilities(api_capabilities)
+            _LOGGER.debug(
+                "Extracted capabilities from API for %s: %s",
+                mask_serial(self.serial_number),
+                self._device_capabilities,
+            )
+
+            # Validate that we got meaningful capabilities from API
+            if not self._device_capabilities:
+                _LOGGER.warning(
+                    "API capabilities for %s resulted in empty list after normalization: %s",
+                    mask_serial(self.serial_number),
+                    api_capabilities,
+                )
+        except Exception as api_error:
+            _LOGGER.error(
+                "Failed to extract capabilities from API for %s: %s",
+                mask_serial(self.serial_number),
+                api_error,
+            )
+            self._device_capabilities = []
+
+    def _extract_firmware_version(self, device_info) -> None:
+        """Extract firmware version and update information from device info."""
+        self._firmware_version = "Unknown"
+        self._firmware_auto_update_enabled = False
+
+        connected_config = getattr(device_info, "connected_configuration", None)
+        if connected_config:
+            firmware_obj = getattr(connected_config, "firmware", None)
+            if firmware_obj:
+                # Debug: Log all firmware object attributes
+                _LOGGER.debug("Firmware object: %s", firmware_obj)
+                _LOGGER.debug("Firmware object type: %s", type(firmware_obj))
+                if hasattr(firmware_obj, "__dict__"):
+                    _LOGGER.debug("Firmware object attributes: %s", vars(firmware_obj))
+                _LOGGER.debug(
+                    "Firmware object dir: %s",
+                    [attr for attr in dir(firmware_obj) if not attr.startswith("_")],
+                )
+
+                # Extract firmware version
+                firmware_version = getattr(firmware_obj, "version", "Unknown")
+                if firmware_version and firmware_version != "Unknown":
+                    self._firmware_version = firmware_version
+                    _LOGGER.debug("Found firmware version: %s", firmware_version)
+
+                # Extract auto-update setting
+                auto_update = getattr(firmware_obj, "auto_update_enabled", None)
+                if auto_update is not None:
+                    self._firmware_auto_update_enabled = bool(auto_update)
+                    _LOGGER.debug(
+                        "Found firmware auto-update enabled: %s",
+                        self._firmware_auto_update_enabled,
+                    )
+            else:
+                _LOGGER.debug("No firmware object found in connected configuration")
+        else:
+            _LOGGER.debug("No connected configuration found in device info")
+
+    def _device_has_mqtt_support(self, device_info) -> bool:
+        """Check if device has MQTT connection support.
+
+        Only devices with MQTT credentials in connected_configuration can be used.
+        This prevents attempting setup on non-connected devices like floor cleaners.
+
+        Note: For devices with connected_configuration but empty/invalid credentials
+        (e.g., 360 robot vacuums), this returns True to allow cloud-only connection.
+
+        Args:
+            device_info: Device object from libdyson-rest
+
+        Returns:
+            True if device has connected_configuration (MQTT or cloud), False otherwise
+        """
+        try:
+            # lecOnly devices communicate exclusively over BLE — no MQTT support
+            connection_category = getattr(device_info, "connection_category", None)
+            if connection_category == "lecOnly":
+                return False
+
+            connected_config = getattr(device_info, "connected_configuration", None)
+            if not connected_config:
+                return False
+
+            # If device has connected_configuration, it can at least use cloud connection
+            # Even if local MQTT credentials are empty (e.g., 360 robot vacuums)
+            return True
+
+        except (AttributeError, TypeError):
+            return False
+
+    async def _extract_mqtt_credentials(self, cloud_client, device_info) -> dict:
+        """Extract MQTT credentials from device info.
+
+        For devices without local MQTT credentials (e.g., 360 robot vacuums),
+        raises error instructing user to reconfigure with cloud-only connection.
+        """
+        mqtt_username = self.serial_number
+        mqtt_password = ""  # nosec B105 - placeholder, actual password set from device credentials below
+
+        mqtt_obj = self._get_mqtt_object(device_info)
+        if mqtt_obj:
+            mqtt_username = self._get_mqtt_username(mqtt_obj)
+            mqtt_password = self._get_mqtt_password(cloud_client, mqtt_obj)
+        else:
+            _LOGGER.info(
+                "No MQTT object found for device %s - device may only support cloud connection",
+                self.serial_number,
+            )
+
+        # Distinguish between "no credentials" vs "extraction failed"
+        if not mqtt_password:
+            # Check if we at least got an MQTT object with encrypted credentials
+            has_encrypted_creds = mqtt_obj and getattr(
+                mqtt_obj, "local_broker_credentials", ""
+            )
+
+            if has_encrypted_creds:
+                # Credentials exist in API but we couldn't extract them - this is a bug
+                _LOGGER.error(
+                    "Device %s has encrypted local_broker_credentials in API response "
+                    "but extraction failed (encrypted length: %s). "
+                    "This may indicate a bug in credential decryption. "
+                    "Please report this issue with debug logs.",
+                    self.serial_number,
+                    len(has_encrypted_creds),
+                )
+                raise UpdateFailed(
+                    f"Failed to extract local MQTT credentials for device {self.serial_number}. "
+                    "Encrypted credentials found but decryption failed. "
+                    "Please enable debug logging and report this issue."
+                )
+            else:
+                # No encrypted credentials in API - device may be cloud-only by design
+                _LOGGER.warning(
+                    "No local_broker_credentials found in API response for device %s. "
+                    "Connection will use cloud fallback if cloud credentials available. "
+                    "This may be expected for cloud-only devices.",
+                    self.serial_number,
+                )
+
+        self._log_mqtt_credentials(mqtt_username, mqtt_password)
+
+        return {
+            "mqtt_username": mqtt_username,
+            "mqtt_password": mqtt_password,
+        }
+
+    def _get_mqtt_object(self, device_info):
+        """Extract MQTT object from device info."""
+        connected_config = getattr(device_info, "connected_configuration", None)
+        if connected_config:
+            return getattr(connected_config, "mqtt", None)
+        return None
+
+    def _get_mqtt_username(self, mqtt_obj) -> str:
+        """Extract MQTT username from mqtt object."""
+        # Debug: Log all available attributes on the mqtt object
+        mqtt_attrs = [attr for attr in dir(mqtt_obj) if not attr.startswith("_")]
+        _LOGGER.debug("Available MQTT attributes: %s", mqtt_attrs)
+
+        # Check for alternative username fields
+        for username_attr in ["username", "local_username", "broker_username"]:
+            alt_username = getattr(mqtt_obj, username_attr, "")
+            if alt_username:
+                _LOGGER.debug(
+                    "Found alternative username: mqtt.%s = %s",
+                    username_attr,
+                    alt_username,
+                )
+                return alt_username
+
+        return self.serial_number
+
+    def _get_mqtt_password(self, cloud_client, mqtt_obj) -> str:
+        """Extract MQTT password from mqtt object."""
+        # Try to get the decoded/plain password first
+        password = self._get_plain_password(mqtt_obj)
+        if password:
+            return password
+
+        # If no plain password found, decrypt local_broker_credentials
+        return self._decrypt_mqtt_credentials(cloud_client, mqtt_obj)
+
+    def _get_plain_password(self, mqtt_obj) -> str:
+        """Try to get plain text MQTT password from mqtt object."""
+        for attr in [
+            "password",
+            "decoded_password",
+            "local_password",
+            "device_password",
+        ]:
+            mqtt_password = getattr(mqtt_obj, attr, "")
+            if mqtt_password:
+                _LOGGER.debug(
+                    "Found MQTT password using attribute: mqtt.%s (length: %s)",
+                    attr,
+                    len(mqtt_password),
+                )
+                return mqtt_password
+        return ""
+
+    def _decrypt_mqtt_credentials(self, cloud_client, mqtt_obj) -> str:
+        """Decrypt MQTT credentials from local_broker_credentials."""
+        encrypted_credentials = getattr(mqtt_obj, "local_broker_credentials", "")
+
+        _LOGGER.debug(
+            "Attempting to decrypt local_broker_credentials for %s - encrypted length: %s",
+            mask_serial(self.serial_number),
+            len(encrypted_credentials) if encrypted_credentials else 0,
+        )
+
+        if not encrypted_credentials:
+            _LOGGER.warning(
+                "No local_broker_credentials field found for device %s - device may only support cloud connection",
+                mask_serial(self.serial_number),
+            )
+            return ""
+
+        try:
+            # Use libdyson-rest's decrypt method to get local MQTT password
+            decrypted_result = cloud_client.decrypt_local_credentials(
+                encrypted_credentials, self.serial_number
+            )
+
+            # Log what we got back for debugging multi-chunk responses
+            _LOGGER.debug(
+                "Decryption result for %s - type: %s, length: %s",
+                mask_serial(self.serial_number),
+                type(decrypted_result).__name__,
+                len(str(decrypted_result)) if decrypted_result is not None else 0,
+            )
+
+            # Handle multi-chunk responses (e.g., N223 360 robot vacuums)
+            # These devices return multiple data pieces - password is in the second chunk (index 1)
+            mqtt_password = None
+
+            if isinstance(decrypted_result, (list, tuple)):
+                # Multi-chunk response - extract password from index 1
+                if len(decrypted_result) > 1:
+                    mqtt_password = decrypted_result[1]
+                    _LOGGER.debug(
+                        "Multi-chunk credentials for %s - extracted password from index 1 (length: %s)",
+                        mask_serial(self.serial_number),
+                        len(mqtt_password) if mqtt_password else 0,
+                    )
+                elif len(decrypted_result) == 1:
+                    # Only one chunk, use it
+                    mqtt_password = decrypted_result[0]
+                    _LOGGER.debug(
+                        "Single-chunk credentials in list for %s (length: %s)",
+                        mask_serial(self.serial_number),
+                        len(mqtt_password) if mqtt_password else 0,
+                    )
+            elif isinstance(decrypted_result, str):
+                # Single string response (standard format)
+                mqtt_password = decrypted_result
+                _LOGGER.debug(
+                    "String credentials for %s (length: %s)",
+                    mask_serial(self.serial_number),
+                    len(mqtt_password) if mqtt_password else 0,
+                )
+            else:
+                _LOGGER.warning(
+                    "Unexpected decryption result type for %s: %s",
+                    mask_serial(self.serial_number),
+                    type(decrypted_result).__name__,
+                )
+                mqtt_password = str(decrypted_result) if decrypted_result else ""
+
+            if not mqtt_password:
+                _LOGGER.warning(
+                    "Decryption succeeded but resulted in empty password for %s",
+                    mask_serial(self.serial_number),
+                )
+
+            return mqtt_password
+
+        except Exception as e:
+            _LOGGER.error(
+                "Failed to decrypt local credentials for %s: %s (encrypted length: %s)",
+                mask_serial(self.serial_number),
+                e,
+                len(encrypted_credentials) if encrypted_credentials else 0,
+            )
+            return ""
+
+    def _log_mqtt_credentials(self, mqtt_username: str, mqtt_password: str) -> None:
+        """Log MQTT credentials for debugging (partially masked)."""
+        _LOGGER.debug(
+            "MQTT credentials for device %s - Username: %s, Password: *** (length: %s)",
+            mask_serial(self.serial_number),
+            mask_serial(mqtt_username),
+            len(mqtt_password),
+        )
+
+    async def _extract_cloud_credentials(self, cloud_client, device_info) -> dict:
+        """Extract cloud credentials from device info."""
+        cloud_host = None
+        cloud_credentials = {}
+
+        try:
+            # Check for IoT credentials using separate API call
+            _LOGGER.debug(
+                "Requesting IoT credentials for device %s",
+                mask_serial(self.serial_number),
+            )
+            iot_data = await cloud_client.get_iot_credentials(self.serial_number)
+
+            if iot_data:
+                # Extract AWS IoT endpoint
+                cloud_host = getattr(iot_data, "endpoint", None)
+                _LOGGER.debug("Cloud host from iot_data.endpoint: %s", cloud_host)
+
+                # Extract credentials object
+                credentials_obj = getattr(iot_data, "iot_credentials", None)
+                if credentials_obj:
+                    cloud_client_id = str(getattr(credentials_obj, "client_id", ""))
+                    cloud_token_key = str(getattr(credentials_obj, "token_key", ""))
+                    cloud_token_value = str(getattr(credentials_obj, "token_value", ""))
+                    cloud_token_signature = str(
+                        getattr(credentials_obj, "token_signature", "")
+                    )
+                    cloud_custom_authorizer = str(
+                        getattr(credentials_obj, "custom_authorizer_name", "")
+                    )
+
+                    cloud_credentials = {
+                        "client_id": cloud_client_id,
+                        "custom_authorizer_name": cloud_custom_authorizer,
+                        "token_key": cloud_token_key,
+                        "token_value": cloud_token_value,
+                        "token_signature": cloud_token_signature,
+                    }
+
+                    _LOGGER.debug("Successfully extracted cloud credentials")
+                else:
+                    _LOGGER.warning("No credentials object found in IoT data")
+            else:
+                _LOGGER.warning("No IoT data returned from API")
+
+        except Exception as e:
+            _LOGGER.error("Failed to retrieve IoT credentials: %s", e)
+
+        return {
+            "cloud_host": cloud_host,
+            "cloud_credentials": cloud_credentials,
+        }
+
+    async def _create_cloud_device(
+        self, device_info, mqtt_credentials, cloud_credentials
+    ) -> None:
+        """Create and connect to cloud device."""
+        device_host = self._get_device_host(device_info)
+        if device_host.endswith(".local"):
+            device_host = await self._async_resolve_local_host(device_host)
+        mqtt_prefix = self._get_mqtt_prefix(device_info)
+        connection_type = self._get_effective_connection_type()
+
+        # Create cloud credential structure for AWS IoT if available
+        cloud_credential_data = None
+        cloud_host = cloud_credentials.get("cloud_host")
+        creds = cloud_credentials.get("cloud_credentials", {})
+
+        if (
+            cloud_host
+            and creds.get("client_id")
+            and creds.get("token_value")
+            and creds.get("token_signature")
+        ):
+            import json
+
+            cloud_credential_data = json.dumps(creds)
+            _LOGGER.debug("Created cloud credential data structure for AWS IoT")
+
+        # Validate credentials: if no local MQTT password, must have cloud credentials
+        mqtt_password = mqtt_credentials["mqtt_password"]
+        if not mqtt_password and not cloud_credential_data:
+            _LOGGER.error(
+                "Device %s has neither local MQTT credentials nor cloud credentials. "
+                "Cannot establish any connection to this device.",
+                self.serial_number,
+            )
+            raise UpdateFailed(
+                f"Device {self.serial_number} cannot connect: "
+                "No local MQTT credentials found and cloud credentials unavailable. "
+                "This may indicate the device is not properly configured in the Dyson app, "
+                "or there may be an issue with the Dyson API. "
+                "Please check device status in the Dyson app and report if issue persists."
+            )
+
+        # Log connection strategy based on available credentials
+        if not mqtt_password and cloud_credential_data:
+            _LOGGER.info(
+                "Device %s will use cloud-only connection "
+                "(no local MQTT credentials available in API response)",
+                self.serial_number,
+            )
+        elif connection_type == "cloud_only":
+            _LOGGER.info(
+                "Device %s configured for cloud-only connection by user preference",
+                self.serial_number,
+            )
+
+        from .device import DysonDevice
+
+        ha_uuid = await ha_instance_id.async_get(self.hass)
+        mqtt_client_id = hashlib.sha256(
+            f"{ha_uuid}{self.serial_number}".encode()
+        ).hexdigest()[:23]
+
+        self.device = DysonDevice(
+            self.hass,
+            self.serial_number,
+            device_host,
+            mqtt_password,
+            mqtt_prefix,
+            self._device_capabilities,
+            connection_type,
+            cloud_host,
+            cloud_credential_data,
+            self._device_category,
+            mqtt_client_id=mqtt_client_id,
+        )
+
+        # Set firmware version in the device for proper device info
+        if self._firmware_version != "Unknown":
+            self.device.set_firmware_version(self._firmware_version)
+
+        # Let DysonDevice handle the connection
+        connected = await self.device.connect(force=True)
+        if not connected:
+            raise UpdateFailed(f"Failed to connect to device {self.serial_number}")
+
+        # Now that device is connected, refine capabilities based on actual device state
+        await self._refine_capabilities_from_device_state()
+
+        # Register for environmental update notifications
+        self.device.add_environmental_callback(self._on_environmental_update)
+        # Register for message updates to get real-time state changes
+        self.device.add_message_callback(self._on_message_update)
+
+    async def _async_setup_manual_device(self) -> None:
+        """Set up device configured manually."""
+        try:
+            _LOGGER.info(
+                "Setting up manual device: %s", mask_serial(self.serial_number)
+            )
+
+            # Get configuration from config entry
+            serial_number = self.config_entry.data[CONF_SERIAL_NUMBER]
+            credential = self.config_entry.data[CONF_CREDENTIAL]
+            mqtt_prefix = self.config_entry.data[CONF_MQTT_PREFIX]
+            hostname = self.config_entry.data.get(CONF_HOSTNAME, "").strip()
+            device_category = self.config_entry.data.get("device_category", ["ec"])
+            capabilities = self.config_entry.data.get("capabilities", [])
+
+            # Set device type, category and capabilities from config entry
+            from .device_utils import normalize_capabilities, normalize_device_category
+
+            device_type = self.config_entry.data.get("device_type", "438")
+            device_category = self.config_entry.data.get("device_category", ["ec"])
+            capabilities = self.config_entry.data.get("capabilities", [])
+
+            # Ensure consistent normalization
+            self._device_type = str(device_type)
+            self._device_category = normalize_device_category(device_category)
+            self._device_capabilities = normalize_capabilities(capabilities)
+
+            _LOGGER.debug(
+                "Manual device setup - device_type: %s, category: %s, capabilities: %s",
+                self._device_type,
+                self._device_category,
+                self._device_capabilities,
+            )
+
+            # Validate that we have required information for manual setup
+            if not hostname:
+                raise UpdateFailed(
+                    f"Manual device setup requires hostname/IP address for device {serial_number}"
+                )
+
+            # Get connection type from config entry
+            connection_type = self._get_effective_connection_type()
+
+            # For manual setup, we don't have cloud credentials
+            ha_uuid = await ha_instance_id.async_get(self.hass)
+            mqtt_client_id = hashlib.sha256(
+                f"{ha_uuid}{serial_number}".encode()
+            ).hexdigest()[:23]
+
+            self.device = DysonDevice(
+                self.hass,
+                serial_number,
+                hostname,  # Device hostname (required for manual setup)
+                credential,  # Local MQTT credential
+                mqtt_prefix,  # User-provided MQTT prefix
+                self._device_capabilities,
+                connection_type,
+                None,  # No cloud host for manual setup
+                None,  # No cloud credential for manual setup
+                self._device_category,
+                mqtt_client_id=mqtt_client_id,
+            )
+
+            # Set unknown firmware version since we don't get it from cloud
+            self.device.set_firmware_version("Unknown")
+
+            # Let DysonDevice handle the connection
+            connected = await self.device.connect(force=True)
+            if not connected:
+                raise UpdateFailed(
+                    f"Failed to connect to manual device {self.serial_number}"
+                )
+
+            # For manual devices, trust user's capability selection - no refinement needed
+            _LOGGER.debug(
+                "Manual device %s connected - using user-selected capabilities: %s",
+                self.serial_number,
+                self._device_capabilities,
+            )
+
+            # Register for environmental update notifications
+            self.device.add_environmental_callback(self._on_environmental_update)
+
+            # Register for message updates to get real-time state changes
+            self.device.add_message_callback(self._on_message_update)
+
+            _LOGGER.info(
+                "Successfully set up manual device %s", mask_serial(self.serial_number)
+            )
+
+        except Exception as err:
+            _LOGGER.error(
+                "Failed to set up manual device %s: %s",
+                mask_serial(self.serial_number),
+                err,
+            )
+            raise UpdateFailed(f"Manual device setup failed: {err}") from err
+
+    async def _async_setup_sticker_device(self) -> None:
+        """Set up device using sticker/WiFi method."""
+        # TODO: Update this method to use paho-mqtt directly
+        raise UpdateFailed(
+            "Sticker discovery method temporarily disabled - use cloud discovery instead"
+        )
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Update data from the device - mainly for connectivity checks."""
+        if not self.device:
+            raise UpdateFailed("Device not initialized")
+
+        _LOGGER.debug("Checking connectivity for device %s", self.serial_number)
+
+        try:
+            # Check if device is still connected, but don't aggressively reconnect during normal operation
+            # The device has its own reconnection logic that should be allowed to work
+            if not self.device.is_connected:
+                _LOGGER.debug(
+                    "Device %s not connected, waiting for reconnection",
+                    self.serial_number,
+                )
+                # Don't force reconnection here - let the device's own logic handle it
+                # This prevents loops where coordinator interferes with device reconnection timing
+                raise UpdateFailed(
+                    f"Device {self.serial_number} not connected - will retry on next update"
+                )
+
+            # For initial refresh with environmental capability, explicitly request state and wait for complete response
+            # REQUEST-CURRENT-STATE triggers TWO response messages:
+            # 1. CURRENT-STATE (with product-state, scheduler, etc.)
+            # 2. ENVIRONMENTAL-CURRENT-SENSOR-DATA (with tact, hact, pact, vact, etc.)
+            # We must wait for BOTH before declaring initial refresh complete
+            if not self.data:  # Initial refresh - no cached data yet
+                capabilities = self.device_capabilities or []
+                has_environmental_capability = any(
+                    cap.lower()
+                    in [
+                        "environmentaldata",
+                        "environmental_data",
+                        "extendedaq",
+                        "extended_aq",
+                    ]
+                    for cap in capabilities
+                )
+
+                if has_environmental_capability:
+                    _LOGGER.debug(
+                        "Initial refresh for device %s with environmental capability - requesting state",
+                        self.serial_number,
+                    )
+                    # Request current state - newer devices respond with both CURRENT-STATE
+                    # and a separate ENVIRONMENTAL-CURRENT-SENSOR-DATA message automatically.
+                    # Older devices (e.g. TP04) embed environmental data in the CURRENT-STATE
+                    # message itself but do NOT send the separate environmental message.
+                    await self.device.send_command(MQTT_CMD_REQUEST_CURRENT_STATE)
+
+                    # Wait for CURRENT-STATE (and ENVIRONMENTAL-CURRENT-SENSOR-DATA if sent automatically)
+                    # Typical timing: CURRENT-STATE at ~140ms, ENVIRONMENTAL-CURRENT-SENSOR-DATA at ~250ms
+                    await asyncio.sleep(0.5)
+
+                    # Check whether _environmental_data was populated by an automatic
+                    # ENVIRONMENTAL-CURRENT-SENSOR-DATA response.  If not, the device
+                    # does not include it automatically (older firmware), so request it
+                    # explicitly so sensor entities can be set up correctly.
+                    if not self.device.get_environmental_data():
+                        _LOGGER.debug(
+                            "Device %s did not return environmental data with CURRENT-STATE - "
+                            "requesting explicitly (older device firmware)",
+                            self.serial_number,
+                        )
+                        await self.device.send_command(MQTT_CMD_REQUEST_ENVIRONMENT)
+                        await asyncio.sleep(0.5)
+
+                    _LOGGER.debug(
+                        "Completed wait for initial state messages from %s",
+                        self.serial_number,
+                    )
+
+            # Get current device state (from last received MQTT message)
+            device_state = await self.device.get_state()
+
+            # Add environmental data to the state following Home Assistant best practices
+            if (
+                hasattr(self.device, "_environmental_data")
+                and self.device.get_environmental_data()
+            ):
+                device_state["environmental-data"] = dict(
+                    self.device.get_environmental_data()
+                )
+                _LOGGER.debug(
+                    "Added environmental data to coordinator state for %s: %s",
+                    self.serial_number,
+                    list(self.device.get_environmental_data().keys()),
+                )
+
+            _LOGGER.debug(
+                "Retrieved complete device state for %s with keys: %s",
+                self.serial_number,
+                list(device_state.keys()) if device_state else "None",
+            )
+
+            # Ensure services are registered now that device capabilities are available
+            await self.ensure_device_services_registered()
+
+            # Periodic fault polling for all devices
+            # This ensures fault sensors receive regular updates
+            try:
+                await self.device.request_current_faults()
+                _LOGGER.debug(
+                    "Requested current faults for device %s",
+                    self.serial_number,
+                )
+            except Exception as fault_err:
+                _LOGGER.debug(
+                    "Failed to request faults for device %s: %s",
+                    self.serial_number,
+                    fault_err,
+                )
+
+            self._async_update_configured_host_issue()
+
+            return device_state
+
+        except UpdateFailed:
+            # Re-raise UpdateFailed exceptions
+            raise
+        except Exception as err:
+            _LOGGER.error(
+                "Error checking connectivity for device %s: %s", self.serial_number, err
+            )
+            raise UpdateFailed(f"Error communicating with device: {err}") from err
+
+    async def _async_handle_faults(self) -> None:
+        """Handle device faults by firing events."""
+        if not self.device:
+            return
+
+        faults = await self.device.get_faults()
+
+        # Only log and fire events for actual faults (not OK statuses)
+        for fault in faults:
+            # The device.get_faults() method now filters out OK statuses
+            _LOGGER.info(
+                "Device fault detected for %s: %s",
+                self.serial_number,
+                fault.get("description", fault),
+            )
+
+            # Fire event for device fault
+            self.hass.bus.async_fire(
+                EVENT_DEVICE_FAULT,
+                {
+                    "device_id": self.serial_number,
+                    "fault": fault,
+                    "timestamp": fault.get("time"),
+                },
+            )
+
+    async def async_send_command(
+        self, command: str, data: dict[str, Any] | None = None
+    ) -> bool:
+        """Send a command to the device."""
+        if not self.device:
+            _LOGGER.error("Cannot send command - device not initialized")
+            return False
+
+        try:
+            await self.device.send_command(command, data)
+
+            # Request updated state after command
+            await asyncio.sleep(1)  # Give device time to process
+            await self.async_request_refresh()
+
+            return True
+
+        except Exception as err:
+            _LOGGER.error(
+                "Failed to send command to device %s: %s", self.serial_number, err
+            )
+            return False
+
+    async def async_set_firmware_auto_update(self, enabled: bool) -> bool:
+        """Set firmware auto-update setting.
+
+        Note: This function updates the local state immediately for UI responsiveness,
+        but the actual API call to change the setting is not yet implemented as the
+        libdyson-rest API endpoint for this feature is not documented.
+        """
+        if self.config_entry.data.get(CONF_DISCOVERY_METHOD) != DISCOVERY_CLOUD:
+            _LOGGER.warning(
+                "Firmware auto-update setting only available for cloud-discovered devices"
+            )
+            return False
+
+        _LOGGER.info(
+            "Setting firmware auto-update for %s to %s", self.serial_number, enabled
+        )
+
+        # Update local state immediately for UI responsiveness
+        old_value = self._firmware_auto_update_enabled
+        self._firmware_auto_update_enabled = enabled
+
+        # Notify listeners of the state change
+        self.async_update_listeners()
+
+        # TODO: Implement actual API call to Dyson cloud service
+        # when the libdyson-rest API endpoint for this feature becomes available
+        _LOGGER.debug(
+            "Updated firmware auto-update setting for %s from %s to %s (API call not yet implemented)",
+            self.serial_number,
+            old_value,
+            enabled,
+        )
+
+        return True
+
+    async def async_check_firmware_update(self) -> bool:
+        """Check for available firmware updates using libdyson-rest >=0.7.0"""
+        if self.config_entry.data.get(CONF_DISCOVERY_METHOD) != DISCOVERY_CLOUD:
+            _LOGGER.debug(
+                "Firmware update check only available for cloud-discovered devices"
+            )
+            return False
+
+        try:
+            # Create a temporary cloud client for the update check
+            cloud_client = await self._authenticate_cloud_client()
+
+            try:
+                # Use new libdyson-rest 0.7.0b1 async method
+                pending_release = await cloud_client.get_pending_release(
+                    self.serial_number
+                )
+
+                if pending_release:
+                    self._firmware_latest_version = pending_release.version
+                    _LOGGER.info(
+                        "Firmware update available for %s: %s",
+                        self.serial_number,
+                        pending_release.version,
+                    )
+
+                    # Notify listeners of the update
+                    self.async_update_listeners()
+                    return True
+                else:
+                    self._firmware_latest_version = self._firmware_version
+                    _LOGGER.debug(
+                        "No firmware update available for %s", self.serial_number
+                    )
+                    return False
+            finally:
+                # Ensure client is properly closed
+                await cloud_client.close()
+
+        except (DysonAPIError, DysonAuthError, DysonConnectionError) as e:
+            # Handle specific Dyson API errors
+            _LOGGER.debug(
+                "Dyson API error checking firmware update for %s: %s",
+                self.serial_number,
+                e,
+            )
+            self._firmware_latest_version = self._firmware_version
+            return False
+        except Exception as e:
+            # Handle other unexpected errors
+            _LOGGER.debug(
+                "Unexpected error checking firmware update for %s: %s",
+                self.serial_number,
+                e,
+            )
+            self._firmware_latest_version = self._firmware_version
+            return False
+
+    async def async_install_firmware_update(self, version: str) -> bool:
+        """Install firmware update via cloud API.
+
+        The firmware update process works as follows:
+        1. Trigger update via cloud API (trigger_firmware_update)
+        2. Device responds with progress updates via MQTT on topic ending with /status/software
+
+        Known MQTT Progress Values (key TBD):
+        - "acknowledged": Download started
+        - "downloaded": Installation started
+        - Additional status values may exist for completion/failure
+
+        TODO: Implement MQTT status monitoring once the JSON key is identified.
+        Expected topic: {mqtt_root}/{serial_number}/status/software
+        Example: PREF/SER-IA-L0001/status/software
+        """
+        # Only cloud-discovered devices support firmware updates
+        if self.config_entry.data.get(CONF_DISCOVERY_METHOD) != DISCOVERY_CLOUD:
+            _LOGGER.error(
+                "Firmware updates are only supported for cloud-discovered devices"
+            )
+            return False
+
+        try:
+            _LOGGER.info(
+                "Initiating firmware update for %s to version %s",
+                self.serial_number,
+                version,
+            )
+
+            # Mark update as in progress before attempting
+            self._firmware_update_in_progress = True
+            self.async_update_listeners()
+
+            # Authenticate cloud client
+            cloud_client = await self._authenticate_cloud_client()
+
+            try:
+                # Trigger firmware update using the new cloud API method
+                success = await cloud_client.trigger_firmware_update(self.serial_number)
+
+                if success:
+                    _LOGGER.info(
+                        "Firmware update initiated successfully for %s",
+                        self.serial_number,
+                    )
+                    return True
+                else:
+                    _LOGGER.error(
+                        "Cloud API returned failure for firmware update on %s",
+                        self.serial_number,
+                    )
+                    self._firmware_update_in_progress = False
+                    self.async_update_listeners()
+                    return False
+
+            finally:
+                # Always close the cloud client
+                await cloud_client.close()
+
+        except Exception as e:
+            _LOGGER.error(
+                "Error installing firmware update for %s: %s", self.serial_number, e
+            )
+            self._firmware_update_in_progress = False
+            self.async_update_listeners()
+            return False
+
+    @property
+    def _configured_host_issue_id(self) -> str:
+        """Return the repair issue id for this device entry."""
+        return f"configured_host_unreachable_{self.config_entry.entry_id}"
+
+    @callback
+    def _async_update_configured_host_issue(self) -> None:
+        """Warn in Repairs while a configured host fails and cloud is used instead.
+
+        A static hostname always wins over discovery, so when that address
+        stops answering the device silently stays on its cloud fallback. The
+        issue is raised only after the fallback has lasted a while, so a short
+        local outage does not flash a warning, and it clears itself once the
+        local connection is back.
+        """
+        hostname = self.config_entry.data.get(CONF_HOSTNAME, "").strip()
+        device = self.device
+        on_fallback = (
+            bool(hostname)
+            and device is not None
+            and device.preferred_connection_type == "local"
+            and device.using_fallback
+        )
+        if not on_fallback:
+            self._local_fallback_since = None
+            ir.async_delete_issue(self.hass, DOMAIN, self._configured_host_issue_id)
+            return
+
+        now = time.monotonic()
+        if self._local_fallback_since is None:
+            self._local_fallback_since = now
+        if now - self._local_fallback_since < CONFIGURED_HOST_ISSUE_DELAY:
+            return
+
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            self._configured_host_issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="configured_host_unreachable",
+            translation_placeholders={
+                "device_name": self.config_entry.title,
+                "hostname": hostname,
+            },
+        )
+
+    async def async_shutdown(self) -> None:
+        """Shutdown the coordinator and cleanup connections."""
+        _LOGGER.debug("Shutting down coordinator for device %s", self.serial_number)
+
+        ir.async_delete_issue(self.hass, DOMAIN, self._configured_host_issue_id)
+
+        if self.device:
+            # Remove environmental callback before disconnecting
+            self.device.remove_environmental_callback(self._on_environmental_update)
+            # Remove message callback before disconnecting
+            self.device.remove_message_callback(self._on_message_update)
+            await self.device.disconnect()
+            self.device = None
+
+    def _extract_capabilities(self, device_info: Any) -> list[str]:
+        """Extract device capabilities from cloud device info."""
+        capabilities: list[str] = []
+
+        # Get capabilities from device info if available
+        if hasattr(device_info, "capabilities"):
+            capabilities = device_info.capabilities or []
+        elif hasattr(device_info, "connected_configuration"):
+            # Try nested structure: device_info.connected_configuration.firmware.capabilities
+            connected_config = device_info.connected_configuration
+            if connected_config and hasattr(connected_config, "firmware"):
+                firmware = connected_config.firmware
+                if firmware and hasattr(firmware, "capabilities"):
+                    capabilities = firmware.capabilities or []
+
+        # Add virtual capabilities based on product type as per discovery.md
+        # PH models should have humidifier capability
+        # Note: Heating capability is now determined dynamically after connection
+        # by checking for 'hmod' state key presence in _refine_capabilities_from_device_state()
+        product_type = getattr(
+            device_info, "product_type", getattr(device_info, "type", "")
+        )
+
+        if product_type:
+            # PH and 358-series models (Purifier/Humidifier) should have virtual Humidifier capability
+            if product_type.startswith("PH") or product_type.startswith("358"):
+                if "Humidifier" not in capabilities:
+                    capabilities.append("Humidifier")
+                    _LOGGER.debug(
+                        "Added virtual Humidifier capability for model %s",
+                        product_type,
+                    )
+
+        _LOGGER.debug("Raw extracted capabilities from device_info: %s", capabilities)
+        _LOGGER.debug(
+            "Capability types: %s", [type(cap).__name__ for cap in capabilities]
+        )
+
+        # Remove duplicates and return
+        final_capabilities = list(set(capabilities))
+        _LOGGER.debug("Final capabilities after deduplication: %s", final_capabilities)
+        return final_capabilities
+
+    async def _refine_capabilities_from_device_state(self) -> None:
+        """Refine device capabilities based on actual device state keys after connection.
+
+        This method checks for specific state keys in the device's current state
+        to determine if certain capabilities should be added or removed.
+        For example, the presence of 'hmod' key indicates heating capability.
+
+        Note: Manual devices skip this refinement to trust user's explicit capability selection.
+        """
+        # Skip capability refinement for manual devices - trust user's selection
+        discovery_method = self.config_entry.data.get(
+            CONF_DISCOVERY_METHOD, DISCOVERY_CLOUD
+        )
+        if discovery_method == DISCOVERY_MANUAL:
+            _LOGGER.debug(
+                "Skipping capability refinement for manual device %s - trusting user selection",
+                self.serial_number,
+            )
+            return
+
+        if not self.device or not self.device.is_connected:
+            _LOGGER.debug("Device not connected, skipping capability refinement")
+            return
+
+        try:
+            # Request current state to ensure we have fresh data for capability detection
+            try:
+                await self.device.send_command(MQTT_CMD_REQUEST_CURRENT_STATE)
+                _LOGGER.debug("Requested current state for capability refinement")
+
+                # Give device a moment to respond with current state
+                import asyncio
+
+                await asyncio.sleep(2)
+            except Exception as cmd_err:
+                _LOGGER.warning(
+                    "Failed to request current state for capability refinement: %s",
+                    cmd_err,
+                )
+
+            # Get current device state to check for capability-indicating keys
+            device_state = await self.device.get_state()
+            _LOGGER.debug("Device state for capability refinement: %s", device_state)
+
+            # Check for heating and humidifier capabilities based on state key presence
+            product_state = device_state.get("product-state", {})
+            original_capabilities = list(self._device_capabilities)  # Make a copy
+
+            if "hmod" in product_state:
+                # Device has heating mode state key, so it supports heating
+                if "Heating" not in self._device_capabilities:
+                    self._device_capabilities.append("Heating")
+                    _LOGGER.debug(
+                        "Device %s supports heating ('hmod' key found) - capability added for internal consistency",
+                        self.serial_number,
+                    )
+            else:
+                # Device doesn't have heating mode state key, remove heating capability if present
+                if "Heating" in self._device_capabilities:
+                    self._device_capabilities.remove("Heating")
+                    _LOGGER.debug(
+                        "Device %s does not support heating ('hmod' key not found) - capability removed",
+                        self.serial_number,
+                    )
+
+            if "hume" in product_state:
+                # Device has humidity mode state key, so it supports humidification
+                if "Humidifier" not in self._device_capabilities:
+                    self._device_capabilities.append("Humidifier")
+                    _LOGGER.debug(
+                        "Device %s supports humidification ('hume' key found) - capability added for internal consistency",
+                        self.serial_number,
+                    )
+            else:
+                # Device doesn't have humidity mode state key, remove humidifier capability if present
+                if "Humidifier" in self._device_capabilities:
+                    self._device_capabilities.remove("Humidifier")
+                    _LOGGER.debug(
+                        "Device %s does not support humidification ('hume' key not found) - capability removed",
+                        self.serial_number,
+                    )
+
+            if "ffoc" in product_state:
+                # Device has focus/diffuse mode state key (older HP02-type devices)
+                if "FocusMode" not in self._device_capabilities:
+                    self._device_capabilities.append("FocusMode")
+                    _LOGGER.debug(
+                        "Device %s supports focus/diffuse mode ('ffoc' key found) - capability added",
+                        self.serial_number,
+                    )
+            else:
+                # Device doesn't have focus mode state key, remove capability if present
+                if "FocusMode" in self._device_capabilities:
+                    self._device_capabilities.remove("FocusMode")
+                    _LOGGER.debug(
+                        "Device %s does not support focus/diffuse mode ('ffoc' key not found) - capability removed",
+                        self.serial_number,
+                    )
+
+            # Detect HP02 power control type immediately from CURRENT-STATE response
+            # This provides instant detection instead of waiting for STATE-CHANGE messages
+            # HP02 devices use fmod for power control and don't have fpwr key
+            # Modern devices use fpwr for power control and may have fmod for other purposes
+            if "fpwr" in product_state:
+                # Device has fpwr key - modern device regardless of fmod presence
+                power_control_type = "fpwr"
+                if "fmod" in product_state:
+                    _LOGGER.debug(
+                        "Device %s uses fpwr-based power control (modern device with both fpwr and fmod keys)",
+                        self.serial_number,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Device %s uses fpwr-based power control (modern device with fpwr key only)",
+                        self.serial_number,
+                    )
+            elif "fmod" in product_state:
+                # Device has fmod but no fpwr - HP02-style device using fmod for power control
+                power_control_type = "fmod"
+                _LOGGER.debug(
+                    "Device %s uses fmod-based power control (HP02-style device: fmod present, fpwr absent)",
+                    self.serial_number,
+                )
+            else:
+                # Device has neither - unknown power control
+                power_control_type = None
+                _LOGGER.debug(
+                    "Device %s power control type unknown (neither fpwr nor fmod keys present)",
+                    self.serial_number,
+                )
+
+            # Set power control type on device for immediate use
+            if power_control_type and self.device:
+                self.device._power_control_type = power_control_type
+                _LOGGER.debug(
+                    "Device %s power control type set to %s for immediate use",
+                    self.serial_number,
+                    power_control_type,
+                )
+
+            # Log capability changes at debug level to avoid confusion
+            if original_capabilities != self._device_capabilities:
+                _LOGGER.debug(
+                    "Capabilities refined for %s based on device state: %s -> %s",
+                    self.serial_number,
+                    original_capabilities,
+                    self._device_capabilities,
+                )
+            else:
+                _LOGGER.debug(
+                    "Device capabilities match detected state for %s",
+                    self.serial_number,
+                )
+
+        except Exception as err:
+            _LOGGER.warning(
+                "Failed to refine capabilities from device state for %s: %s",
+                self.serial_number,
+                err,
+            )
+            # Don't raise - capability refinement is optional
+
+    async def _async_resolve_local_host(self, hostname: str) -> str:
+        """Resolve a .local hostname through Home Assistant's mDNS listener.
+
+        The OS resolver cannot be relied on: Dyson devices answer mDNS with IP TTL 16
+        (RFC 6762 requires 255) and systemd-resolved silently drops such replies.
+        Returns the hostname unchanged if nothing answers, so behaviour is otherwise as before.
+        """
+        try:
+            from homeassistant.components import zeroconf as ha_zeroconf
+            from zeroconf import AddressResolver, IPVersion
+
+            aiozc = await ha_zeroconf.async_get_async_instance(self.hass)
+            resolver = AddressResolver(hostname.rstrip(".") + ".")
+            if await resolver.async_request(aiozc.zeroconf, 3000):
+                addrs = resolver.ip_addresses_by_version(IPVersion.V4Only)
+                if addrs:
+                    _LOGGER.info("Resolved %s via mDNS to %s", hostname, addrs[0])
+                    return str(addrs[0])
+            _LOGGER.debug(
+                "mDNS resolution of %s found nothing; keeping hostname", hostname
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("mDNS resolution of %s failed: %s", hostname, err)
+        return hostname
+
+    def _get_device_host(self, device_info: Any) -> str:
+        """Get device host/IP address from device info or config.
+
+        Priority order:
+        1. User-provided static IP/hostname from config entry (bypasses mDNS)
+        2. Hostname from device_info (cloud API)
+        3. IP learned via DHCP discovery (see async_step_dhcp in config_flow.py)
+        4. Fall back to {serial}.local for mDNS resolution
+        """
+        # Check if user provided a static IP/hostname in config entry
+        configured_hostname = self.config_entry.data.get(CONF_HOSTNAME, "").strip()
+        if configured_hostname:
+            _LOGGER.info(
+                "Using configured hostname for device %s: %s",
+                self.serial_number,
+                configured_hostname,
+            )
+            return configured_hostname
+
+        # For cloud devices, try to get the local IP from API if available
+        api_hostname = getattr(device_info, "hostname", None)
+        if api_hostname:
+            _LOGGER.debug(
+                "Using hostname from cloud API for device %s: %s",
+                self.serial_number,
+                api_hostname,
+            )
+            return api_hostname
+
+        # Use IP learned via DHCP discovery, if any, before resorting to mDNS
+        dhcp_host = self.config_entry.data.get(CONF_DHCP_HOST, "").strip()
+        if dhcp_host:
+            _LOGGER.debug(
+                "Using DHCP-discovered host for device %s: %s",
+                mask_serial(self.serial_number),
+                dhcp_host,
+            )
+            return dhcp_host
+
+        # Fall back to mDNS resolution using {serial}.local
+        fallback_hostname = f"{self.serial_number}.local"
+        _LOGGER.debug(
+            "Using fallback hostname for device %s: %s.local",
+            mask_serial(self.serial_number),
+            mask_serial(self.serial_number),
+        )
+        return fallback_hostname
+
+    def _get_mqtt_prefix(self, device_info: Any) -> str:
+        """Get MQTT prefix from device info using API-first approach.
+
+        This method prioritizes API-provided MQTT prefix information over hardcoded
+        mappings to ensure accurate discovery and prevent masking of connection issues.
+        Only falls back to product type construction when API data is unavailable.
+        """
+        # First, try to get MQTT prefix directly from the API
+        mqtt_prefix = self._extract_mqtt_prefix_from_api(device_info)
+        if mqtt_prefix:
+            _LOGGER.debug("Using MQTT prefix from API: %s", mqtt_prefix)
+            return mqtt_prefix
+
+        # If no API prefix available, construct from device info
+        constructed_prefix = self._construct_mqtt_prefix_fallback_from_device_info(
+            device_info
+        )
+
+        # Extract product info for logging
+        product_type = getattr(
+            device_info, "product_type", getattr(device_info, "type", "unknown")
+        )
+        variant = getattr(device_info, "variant", None)
+
+        _LOGGER.warning(
+            "No MQTT prefix found in API for device %s, constructed from product_type=%s variant=%s: %s",
+            self.serial_number,
+            product_type,
+            variant,
+            constructed_prefix,
+        )
+        return constructed_prefix
+
+    def _extract_mqtt_prefix_from_api(self, device_info: Any) -> str | None:
+        """Extract MQTT prefix from API device info."""
+        # Try to get MQTT prefix from connected configuration
+        connected_config = getattr(device_info, "connected_configuration", None)
+        if not connected_config:
+            return None
+
+        mqtt_obj = getattr(connected_config, "mqtt", None)
+        if not mqtt_obj:
+            return None
+        # Check for the actual MQTT prefix field from the API
+        mqtt_root_topic = getattr(mqtt_obj, "mqtt_root_topic_level", None)
+        if mqtt_root_topic:
+            _LOGGER.debug(
+                "Found MQTT prefix from API mqtt_root_topic_level: %s", mqtt_root_topic
+            )
+            return str(mqtt_root_topic)
+
+        return None
+
+    def _construct_mqtt_prefix_fallback_from_device_info(self, device_info: Any) -> str:
+        """Construct MQTT prefix from device info using Dyson's naming conventions.
+
+        Extracts product_type and variant from device_info and applies the fallback rules:
+        - If product_type ends in a letter OR variant is empty/None: use product_type
+        - If product_type does not end in a letter AND variant exists: use product_type + variant
+        """
+        # Extract product type and variant from device info
+        product_type = getattr(
+            device_info, "product_type", getattr(device_info, "type", "438")
+        )
+        variant = getattr(device_info, "variant", None)
+
+        return self._construct_mqtt_prefix_fallback(product_type, variant)
+
+    def _construct_mqtt_prefix_fallback(
+        self, product_type: str, variant: str | None
+    ) -> str:
+        """Construct MQTT prefix from product type and variant using Dyson's naming conventions.
+
+        Rules:
+        - If product_type ends in a letter OR variant is empty/None: use product_type
+        - If product_type does not end in a letter AND variant exists: use product_type + variant
+        """
+        product_type = str(product_type)
+        # Check if product type ends in a letter
+        ends_in_letter = product_type and product_type[-1].isalpha()
+        # Check if variant is meaningful
+        has_variant = variant and str(variant).strip()
+        if ends_in_letter or not has_variant:
+            # Use product type as-is
+            return product_type
+        else:
+            # Combine product type with variant
+            return product_type + str(variant)
+
+
+class DysonCloudAccountCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Coordinator to manage cloud account and device discovery."""
+
+    def __init__(self, hass: HomeAssistant, config_entry) -> None:  # type: ignore
+        """Initialize the cloud account coordinator."""
+        self.config_entry = config_entry
+        self._email = config_entry.data.get("email")
+        self._auth_token = config_entry.data.get("auth_token")
+        self._country = config_entry.data.get(CONF_COUNTRY, "US")
+        self._culture = config_entry.data.get(CONF_CULTURE, "en-US")
+        self._last_known_devices = set()
+
+        # Get polling settings with backward-compatible defaults
+        poll_for_devices = config_entry.data.get(
+            CONF_POLL_FOR_DEVICES, DEFAULT_POLL_FOR_DEVICES
+        )
+
+        # Only set up polling if enabled
+        update_interval = None
+        if poll_for_devices:
+            update_interval = timedelta(seconds=DEFAULT_CLOUD_POLLING_INTERVAL)
+            _LOGGER.info(
+                "Cloud device polling enabled for %s, interval: %d seconds",
+                mask_email(self._email),
+                DEFAULT_CLOUD_POLLING_INTERVAL,
+            )
+        else:
+            _LOGGER.info(
+                "Cloud device polling disabled for %s", mask_email(self._email)
+            )
+
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"{DOMAIN}_cloud_account_{mask_email(self._email)}",
+            update_interval=update_interval,
+        )
+
+        # Initialize known devices from config
+        for device_info in config_entry.data.get("devices", []):
+            self._last_known_devices.add(device_info["serial_number"])
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Update data by checking for new devices in the cloud account."""
+        _LOGGER.info(
+            "Cloud coordinator update triggered for account: %s",
+            mask_email(self._email),
+        )
+
+        if not self.config_entry.data.get(
+            CONF_POLL_FOR_DEVICES, DEFAULT_POLL_FOR_DEVICES
+        ):
+            # Polling is disabled, return empty data
+            _LOGGER.debug(
+                "Device polling disabled for account %s", mask_email(self._email)
+            )
+            return {"devices": []}
+
+        try:
+            devices = await self._fetch_cloud_devices()
+            if not devices:
+                return {"devices": []}
+
+            updated_devices = self._build_device_list(devices)
+            await self._process_device_changes(devices, updated_devices)
+
+            return {
+                "devices": [
+                    device_info for device_info in updated_devices if device_info
+                ]
+            }
+
+        except Exception as err:
+            _LOGGER.error(
+                "Error checking for new devices in cloud account %s: %s",
+                mask_email(self._email),
+                err,
+            )
+            raise UpdateFailed(f"Failed to check for new devices: {err}") from err
+
+    async def _fetch_cloud_devices(self):
+        """Fetch devices from cloud API."""
+        _LOGGER.info(
+            "Checking for new devices in Dyson cloud account: %s",
+            mask_email(self._email),
+        )
+
+        # Initialize libdyson-rest client
+        if not self._auth_token:
+            _LOGGER.warning(
+                "No auth token available for cloud account %s", mask_email(self._email)
+            )
+            return []
+
+        _LOGGER.debug(
+            "Fetching cloud devices for %s - country: %s, culture: %s",
+            mask_email(self._email),
+            self._country,
+            self._culture,
+        )
+
+        # Create client with auth token and country/culture for CN API support
+        async with AsyncDysonClient(
+            email=self._email,
+            auth_token=self._auth_token,
+            country=self._country,
+            culture=self._culture,
+        ) as client:
+            # Get devices from cloud API
+            devices = await client.get_devices()
+
+            if not devices:
+                _LOGGER.debug(
+                    "No devices found in cloud account %s", mask_email(self._email)
+                )
+                return []
+
+            return devices
+
+    def _build_device_list(self, devices):
+        """Build device info list from cloud devices."""
+        updated_devices = []
+        for device in devices:
+            # Normalise connection_category: may be a ConnectionCategory enum or
+            # a plain string — store the string value so downstream checks work.
+            conn_cat = getattr(device, "connection_category", None)
+            conn_cat_val = getattr(conn_cat, "value", conn_cat) or ""
+            device_info = {
+                "serial_number": device.serial_number,
+                "name": getattr(device, "name", f"Dyson {device.serial_number}"),
+                "product_type": getattr(device, "product_type", "unknown"),
+                "category": getattr(device, "category", "unknown"),
+                "connection_category": conn_cat_val,
+            }
+            updated_devices.append(device_info)
+        return updated_devices
+
+    async def _process_device_changes(self, devices, updated_devices):
+        """Process new and changed devices."""
+        # Check for new devices
+        current_devices = {device.serial_number for device in devices}
+        new_devices = current_devices - self._last_known_devices
+
+        if new_devices:
+            await self._handle_new_devices(devices, new_devices, updated_devices)
+        else:
+            _LOGGER.debug(
+                "No new devices found in cloud account %s", mask_email(self._email)
+            )
+
+        return new_devices
+
+    async def _handle_new_devices(self, devices, new_devices, updated_devices):
+        """Handle new devices discovered in cloud account."""
+        _LOGGER.info(
+            "Found %d new device(s) in cloud account %s: %s",
+            len(new_devices),
+            mask_email(self._email),
+            list(new_devices),
+        )
+
+        # Get auto_add setting
+        auto_add_devices = self.config_entry.data.get(
+            CONF_AUTO_ADD_DEVICES, DEFAULT_AUTO_ADD_DEVICES
+        )
+
+        # Update the account config entry with new devices
+        updated_data = dict(self.config_entry.data)
+        updated_data["devices"] = updated_devices
+        self.hass.config_entries.async_update_entry(
+            self.config_entry, data=updated_data
+        )
+
+        # Create individual device entries for new devices if auto-add is enabled
+        if auto_add_devices:
+            for device in devices:
+                if device.serial_number in new_devices:
+                    # Normalise connection_category: may be enum or string
+                    conn_cat = getattr(device, "connection_category", None)
+                    conn_cat_val = getattr(conn_cat, "value", conn_cat)
+                    if conn_cat_val == "lecOnly":
+                        _LOGGER.info(
+                            "Skipping BLE-only device %s from auto-add (lecOnly) "
+                            "\u2014 will trigger BLE Light discovery flow instead",
+                            device.serial_number,
+                        )
+                        await self._create_ble_discovery_flow(device)
+                        continue
+                    await self._create_device_entry(device)
+        else:
+            # Create discovery flows for manual device addition
+            for device in devices:
+                if device.serial_number in new_devices:
+                    # Normalise connection_category: may be enum or string
+                    conn_cat = getattr(device, "connection_category", None)
+                    conn_cat_val = getattr(conn_cat, "value", conn_cat)
+                    if conn_cat_val == "lecOnly":
+                        _LOGGER.info(
+                            "Skipping BLE-only device %s from discovery (lecOnly) "
+                            "\u2014 will trigger BLE Light discovery flow instead",
+                            device.serial_number,
+                        )
+                        await self._create_ble_discovery_flow(device)
+                        continue
+                    await self._create_discovery_flow(device)
+            _LOGGER.info(
+                "Auto-add disabled, %d new devices will be available for manual setup",
+                len(new_devices),
+            )
+
+        # Update our known devices set
+        self._last_known_devices = {device.serial_number for device in devices}
+
+    async def _create_device_entry(self, device) -> None:
+        """Create a new device config entry."""
+        from .device_utils import create_cloud_device_config
+
+        device_serial = device.serial_number
+        device_name = getattr(device, "name", f"Dyson {device_serial}")
+
+        # Check if device already exists
+        existing_entries = [
+            entry
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+            if (
+                entry.data.get(CONF_SERIAL_NUMBER) == device_serial
+                and entry.entry_id != self.config_entry.entry_id
+            )
+        ]
+
+        if existing_entries:
+            _LOGGER.debug(
+                "Device %s already has a config entry, skipping", device_serial
+            )
+            return
+
+        # Pass the actual device object to extract capabilities properly
+        device_data = create_cloud_device_config(
+            serial_number=device_serial,
+            username=self._email,
+            device_info=device,  # Pass the actual device object, not a dict
+            auth_token=self._auth_token,
+            parent_entry_id=self.config_entry.entry_id,
+        )
+
+        _LOGGER.info(
+            "Auto-creating config entry for newly discovered device: %s", device_name
+        )
+
+        # Create the device entry
+        result = await self.hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": "device_auto_create"},
+            data=device_data,
+        )
+        _LOGGER.debug("Device entry creation result for %s: %s", device_serial, result)
+
+    async def _create_discovery_flow(self, device) -> None:
+        """Create a native Home Assistant discovery for manual device confirmation."""
+        device_serial = device.serial_number
+        device_name = getattr(device, "name", f"Dyson {device_serial}")
+
+        # Check if device already exists
+        existing_entries = [
+            entry
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+            if (
+                entry.data.get(CONF_SERIAL_NUMBER) == device_serial
+                and entry.entry_id != self.config_entry.entry_id
+            )
+        ]
+
+        if existing_entries:
+            _LOGGER.debug(
+                "Device %s already has a config entry, skipping discovery",
+                device_serial,
+            )
+            return
+
+        # Check if discovery already exists for this device
+        existing_flows = [
+            flow
+            for flow in self.hass.config_entries.flow.async_progress()
+            if (
+                flow["handler"] == DOMAIN
+                and flow.get("context", {}).get("source") == "discovery"
+                and flow.get("context", {}).get("unique_id") == device_serial
+            )
+        ]
+
+        if existing_flows:
+            _LOGGER.debug("Discovery flow already exists for device %s", device_serial)
+            return
+
+        _LOGGER.info(
+            "Creating discovery for device: %s (%s)", device_name, device_serial
+        )
+
+        # Create a native Home Assistant discovery
+        try:
+            result = await self.hass.async_create_task(
+                self.hass.config_entries.flow.async_init(
+                    DOMAIN,
+                    context={
+                        "source": "discovery",
+                        "unique_id": device_serial,
+                    },
+                    data={
+                        "serial_number": device_serial,
+                        "name": device_name,
+                        "product_type": getattr(device, "product_type", "unknown"),
+                        "category": getattr(device, "category", "unknown"),
+                        "connection_category": getattr(
+                            getattr(device, "connection_category", None),
+                            "value",
+                            getattr(device, "connection_category", ""),
+                        )
+                        or "",
+                        "auth_token": self._auth_token,
+                        "email": self._email,
+                        "parent_entry_id": self.config_entry.entry_id,
+                    },
+                )
+            )
+            _LOGGER.info(
+                "Discovery flow created successfully for %s: %s", device_name, result
+            )
+        except Exception as e:
+            _LOGGER.error("Failed to create discovery flow for %s: %s", device_name, e)
+
+    async def _create_ble_discovery_flow(self, device) -> None:
+        """Create a discovery flow that routes the user to the BLE Light setup.
+
+        For lecOnly (BLE-only) devices discovered via cloud polling, we cannot
+        auto-create an entry because BLE pairing requires a MAC address and LTK.
+        Instead, trigger a discovery notification that, when clicked, routes the
+        user directly to the BLE configure step (with serial pre-filled).
+        """
+        device_serial = device.serial_number
+        device_name = getattr(device, "name", f"Dyson {device_serial}")
+
+        # Skip if already set up (BLE or any other entry)
+        existing_entries = [
+            entry
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+            if (
+                entry.data.get(CONF_SERIAL_NUMBER) == device_serial
+                and entry.entry_id != self.config_entry.entry_id
+            )
+        ]
+        if existing_entries:
+            _LOGGER.debug(
+                "BLE device %s already has a config entry, skipping", device_serial
+            )
+            return
+
+        # Skip if a BLE discovery flow is already in progress for this device
+        existing_flows = [
+            flow
+            for flow in self.hass.config_entries.flow.async_progress()
+            if (
+                flow["handler"] == DOMAIN
+                and flow.get("context", {}).get("unique_id") == device_serial
+            )
+        ]
+        if existing_flows:
+            _LOGGER.debug(
+                "Discovery flow already in progress for BLE device %s", device_serial
+            )
+            return
+
+        _LOGGER.info(
+            "Creating BLE discovery flow for lecOnly device: %s (%s)",
+            device_name,
+            device_serial,
+        )
+        try:
+            result = await self.hass.async_create_task(
+                self.hass.config_entries.flow.async_init(
+                    DOMAIN,
+                    context={
+                        "source": "discovery",
+                        "unique_id": device_serial,
+                    },
+                    data={
+                        "serial_number": device_serial,
+                        "name": device_name,
+                        "product_type": getattr(device, "product_type", "unknown"),
+                        "category": getattr(device, "category", "unknown"),
+                        "connection_category": "lecOnly",
+                        "auth_token": self._auth_token,
+                        "email": self._email,
+                        "parent_entry_id": self.config_entry.entry_id,
+                    },
+                )
+            )
+            _LOGGER.info("BLE discovery flow created for %s: %s", device_name, result)
+        except Exception as e:
+            _LOGGER.error(
+                "Failed to create BLE discovery flow for %s: %s", device_name, e
+            )
+
+
+class DysonBLEDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Coordinator for Dyson BLE-only lights (e.g. Lightcycle Morph CD06).
+
+    Manages the BLE connection lifecycle via a dedicated named asyncio Task and
+    propagates state changes received on the Home Assistant event bus to all
+    subscribed entities using :meth:`async_set_updated_data`.
+
+    No MQTT is used.  State arrives via ``EVENT_BLE_STATE_CHANGE`` events fired
+    by :class:`.ble_device.DysonBLEDevice`.
+
+    Attributes:
+        serial_number: Dyson device serial number.
+        ble_device: :class:`.ble_device.DysonBLEDevice` instance or ``None``
+            before initial setup.
+    """
+
+    def __init__(self, hass: HomeAssistant, config_entry) -> None:  # type: ignore
+        """Initialise the BLE coordinator.
+
+        Args:
+            hass: Home Assistant instance.
+            config_entry: Config entry containing ``CONF_SERIAL_NUMBER``,
+                ``CONF_BLE_MAC``, ``CONF_LTK``, and optionally ``CONF_BLE_PROXY``.
+        """
+        self.serial_number: str = config_entry.data[CONF_SERIAL_NUMBER]
+        self.ble_device: DysonBLEDevice | None = None
+        self._config_entry = config_entry
+        self._unsub_event: Any | None = None
+        self._ble_task: asyncio.Task[None] | None = None
+        self._stop_event = asyncio.Event()
+
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"{DOMAIN}_ble_{self.serial_number}",
+            update_interval=None,  # Push-only; no polling
+        )
+
+    def _on_ble_mac_resolved(self, new_mac: str) -> None:
+        """Persist a MAC address rediscovered after a Bluetooth address rotation."""
+        from .const import CONF_BLE_MAC
+
+        self.hass.config_entries.async_update_entry(
+            self._config_entry,
+            data={**self._config_entry.data, CONF_BLE_MAC: new_mac},
+        )
+
+    async def async_setup(self) -> None:
+        """Set up the BLE coordinator: subscribe to events and start BLE task.
+
+        Called by the platform setup after the coordinator is created.  Safe to
+        call more than once (idempotent).
+        """
+        import uuid as _uuid
+
+        from .ble_device import DysonBLEDevice
+        from .const import (
+            BLE_CAPABILITY_DAYLIGHT,
+            BLE_CAPABILITY_PERSONAL_DAYLIGHT,
+            CONF_BLE_MAC,
+            CONF_LTK,
+            EVENT_BLE_STATE_CHANGE,
+        )
+
+        # Use the Dyson account UUID stored in the BLE config entry (set during LTK auto-fetch).
+        # Fall back to the account_uuid in any cloud account config entry, then to a zero UUID
+        # with a warning directing the user to re-authenticate.
+        account_uuid = self._config_entry.data.get("account_uuid", "")
+        if not account_uuid:
+            # Try the parent cloud account entry identified by parent_entry_id.
+            # Walking all hass_dyson entries would silently pick up a UUID from
+            # an unrelated cloud account when the user has multiple accounts
+            # registered, causing LTK re-auth to fail.
+            parent_entry_id = self._config_entry.data.get("parent_entry_id")
+            if parent_entry_id:
+                parent_entry = self.hass.config_entries.async_get_entry(parent_entry_id)
+                if parent_entry:
+                    account_uuid = parent_entry.data.get("account_uuid", "")
+        if not account_uuid:
+            _LOGGER.warning(
+                "No Dyson account UUID found for BLE device %s. "
+                "BLE authentication will likely fail. "
+                "Please delete this device and re-add it after re-authenticating your Dyson cloud account.",
+                self.serial_number,
+            )
+            account_uuid = str(_uuid.UUID(int=0))
+
+        # Recreate with proper account uuid
+        mac = self._config_entry.data.get(CONF_BLE_MAC, "")
+        ltk_hex = self._config_entry.data.get(CONF_LTK, "")
+        from .const import CONF_BLE_PROXY
+
+        ble_proxy = self._config_entry.data.get(CONF_BLE_PROXY)
+        self.ble_device = DysonBLEDevice(
+            hass=self.hass,
+            serial_number=self.serial_number,
+            mac_address=mac,
+            ltk_hex=ltk_hex,
+            account_uuid=account_uuid,
+            ble_proxy=ble_proxy,
+            daylight_capable=(
+                not self.capabilities
+                or BLE_CAPABILITY_DAYLIGHT in self.capabilities
+                or BLE_CAPABILITY_PERSONAL_DAYLIGHT in self.capabilities
+            ),
+            on_mac_resolved=self._on_ble_mac_resolved,
+        )
+
+        # Subscribe to BLE state change events
+        if self._unsub_event is not None:
+            self._unsub_event()
+        self._unsub_event = self.hass.bus.async_listen(
+            EVENT_BLE_STATE_CHANGE, self._handle_ble_event
+        )
+
+        _LOGGER.info(
+            "BLE coordinator setup complete for %s "
+            "(MAC: %s, LTK configured: %s, proxy: %s) — starting connection task",
+            self.serial_number,
+            mac,
+            bool(ltk_hex),
+            ble_proxy or "none (will use local BT adapter)",
+        )
+
+        # Start the BLE connection task as a *background* task so it does not
+        # block HA's startup/bootstrap phase.  async_create_task() registers
+        # the task as a setup dependency; async_create_background_task() does not.
+        self._stop_event.clear()
+        self._ble_task = self.hass.async_create_background_task(
+            self._ble_lifecycle_task(),
+            name=f"dyson-ble-{self.serial_number}",
+        )
+
+    async def async_shutdown(self) -> None:
+        """Shut down the BLE coordinator cleanly on config entry unload.
+
+        Awaiting a task we have just cancelled raises ``CancelledError`` by
+        design, so it is consumed.  Cleanup runs in ``finally`` so it happens
+        on every exit path.
+        """
+        self._stop_event.set()
+        task, self._ble_task = self._ble_task, None
+        try:
+            if task is not None and not task.done():
+                task.cancel()
+                await task
+        except asyncio.CancelledError:
+            # Expected: this is the cancellation we just requested.
+            pass
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug(
+                "BLE lifecycle task for %s ended with %s: %s",
+                mask_serial(self.serial_number),
+                type(exc).__name__,
+                exc,
+            )
+        finally:
+            if self._unsub_event is not None:
+                self._unsub_event()
+                self._unsub_event = None
+            if self.ble_device is not None:
+                await self.ble_device.disconnect()
+
+    async def _ble_lifecycle_task(self) -> None:
+        """Long-lived asyncio task managing BLE connect/reconnect loop.
+
+        Connects to the lamp, then waits for disconnection.  On disconnect,
+        retries with exponential backoff.  Stops when ``_stop_event`` is set.
+        """
+        from .ble_device import _KEEPALIVE_INTERVAL, _RECONNECT_DELAYS
+
+        _LOGGER.info(
+            "BLE lifecycle task started for %s", mask_serial(self.serial_number)
+        )
+        attempt = 0
+        while not self._stop_event.is_set():
+            if self.ble_device is None:
+                _LOGGER.warning(
+                    "BLE lifecycle task: ble_device is None for %s, waiting...",
+                    self.serial_number,
+                )
+                await asyncio.sleep(5)
+                continue
+
+            _LOGGER.info(
+                "BLE lifecycle task: attempting connection for %s (attempt %d)",
+                self.serial_number,
+                attempt + 1,
+            )
+            try:
+                await self.ble_device.connect_and_authenticate()
+                attempt = 0  # Reset backoff on successful connect
+                _LOGGER.info(
+                    "BLE lifecycle task: %s connected — entering keepalive loop",
+                    self.serial_number,
+                )
+                # Keepalive loop: poll state periodically and watch for disconnect
+                while not self._stop_event.is_set() and self.ble_device.is_connected:
+                    await asyncio.sleep(_KEEPALIVE_INTERVAL)
+                    if self.ble_device.is_connected:
+                        await self.ble_device.poll_state()
+                _LOGGER.info(
+                    "BLE lifecycle task: %s exited keepalive loop (connected: %s, stop: %s)",
+                    self.serial_number,
+                    self.ble_device.is_connected,
+                    self._stop_event.is_set(),
+                )
+            except asyncio.CancelledError:
+                _LOGGER.debug("BLE lifecycle task cancelled for %s", self.serial_number)
+                return
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "BLE lifecycle task: connection error for %s (%s: %s)",
+                    self.serial_number,
+                    type(exc).__name__,
+                    exc,
+                )
+
+            if self._stop_event.is_set():
+                _LOGGER.debug(
+                    "BLE lifecycle task: stop requested for %s, exiting",
+                    self.serial_number,
+                )
+                return
+
+            delay_index = min(attempt, len(_RECONNECT_DELAYS) - 1)
+            delay = _RECONNECT_DELAYS[delay_index]
+            _LOGGER.info(
+                "BLE %s disconnected; reconnecting in %ds (attempt %d)",
+                self.serial_number,
+                delay,
+                attempt + 1,
+            )
+            attempt += 1
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+                return  # Stop event set during sleep
+            except asyncio.TimeoutError:
+                pass
+
+    async def _handle_ble_event(self, event: Any) -> None:
+        """Handle ``EVENT_BLE_STATE_CHANGE`` and push data to entities.
+
+        Args:
+            event: Home Assistant event with ``serial_number`` and state data.
+        """
+        data: dict[str, Any] = event.data
+        if data.get("serial_number") != self.serial_number:
+            return
+        state_dict = {k: v for k, v in data.items() if k != "serial_number"}
+        self.async_set_updated_data(state_dict)
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Return current data (no-op; data arrives via events)."""
+        return self.data or {}
+
+    @property
+    def is_connected(self) -> bool:
+        """Return True if the BLE device is connected and authenticated."""
+        return self.ble_device is not None and self.ble_device.is_connected
+
+    @property
+    def capabilities(self) -> list[str]:
+        """Return the list of device capabilities for this BLE light.
+
+        Reads from the ``capabilities`` key stored in the config entry data
+        (populated when the device was discovered via a cloud account).  When
+        not stored, returns an empty list — callers should treat BLE lights
+        (CF06 / CD06 Lightcycle Morph) as daylight-capable by default.
+        """
+        return list(self._config_entry.data.get("capabilities", []))
+
+
+# The keys _publish_cloud_firmware adds to coordinator data.  Named once so a
+# withdrawal removes exactly what a publish added.
+_CLOUD_FIRMWARE_KEYS: Final = frozenset(
+    {
+        "cloud_firmware_version",
+        "cloud_new_version_available",
+        "cloud_pending_version",
+        "cloud_auto_update_enabled",
+    }
+)
+
+
+class DysonBLEVacuumDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Coordinator for Dyson BLE-only floor-cleaning vacuums (e.g. V16).
+
+    Manages the BLE connection lifecycle via a dedicated background task and
+    propagates state changes received on the Home Assistant event bus
+    (``EVENT_BLE_STATE_CHANGE``, fired by :class:`.ble_vacuum.DysonBleVacuumDevice`)
+    to all subscribed entities.
+
+    No MQTT is involved.  Device state lives in the ``attributes`` dict of the
+    underlying transport plus derived session-tracking fields.
+    """
+
+    def __init__(self, hass: HomeAssistant, config_entry) -> None:  # type: ignore
+        """Initialise the BLE vacuum coordinator."""
+        self.serial_number: str = config_entry.data[CONF_SERIAL_NUMBER]
+        self.ble_device: Any | None = None  # DysonBleVacuumDevice at runtime
+        self._config_entry = config_entry
+        self._unsub_event: Any | None = None
+        self._ble_task: asyncio.Task[None] | None = None
+        self._stop_event = asyncio.Event()
+        self._cloud_firmware: dict[str, Any] = {}
+        self._cloud_firmware_checked_at: float = 0.0
+        self._unsub_cloud_firmware: Any | None = None
+
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"{DOMAIN}_ble_vacuum_{self.serial_number}",
+            update_interval=None,  # Push-only; no polling interval
+        )
+
+    def _on_ble_mac_resolved(self, new_mac: str) -> None:
+        """Persist a MAC address rediscovered after a Bluetooth address rotation."""
+        from .const import CONF_BLE_MAC
+
+        self.hass.config_entries.async_update_entry(
+            self._config_entry,
+            data={**self._config_entry.data, CONF_BLE_MAC: new_mac},
+        )
+
+    async def async_setup(self) -> None:
+        """Set up the coordinator: subscribe events and start BLE task."""
+        import uuid as _uuid
+
+        from .ble_vacuum import DysonBleVacuumDevice
+        from .const import (
+            CONF_BLE_MAC,
+            CONF_BLE_PROXY,
+            CONF_LTK,
+        )
+
+        # Resolve the Dyson account UUID for auth payload A (same rules the
+        # light coordinator applies — entry data first, then parent entry).
+        account_uuid = self._config_entry.data.get("account_uuid", "")
+        if not account_uuid:
+            parent_entry_id = self._config_entry.data.get("parent_entry_id")
+            if parent_entry_id:
+                parent_entry = self.hass.config_entries.async_get_entry(parent_entry_id)
+                if parent_entry:
+                    account_uuid = parent_entry.data.get("account_uuid", "")
+        if not account_uuid:
+            _LOGGER.warning(
+                "No Dyson account UUID found for BLE vacuum %s. "
+                "BLE authentication will likely fail. "
+                "Please delete this device and re-add it after re-authenticating your Dyson cloud account.",
+                self.serial_number,
+            )
+            account_uuid = str(_uuid.UUID(int=0))
+
+        mac = self._config_entry.data.get(CONF_BLE_MAC, "")
+        ltk_hex = self._config_entry.data.get(CONF_LTK, "")
+        ble_proxy = self._config_entry.data.get(CONF_BLE_PROXY)
+        self.ble_device = DysonBleVacuumDevice(
+            hass=self.hass,
+            serial_number=self.serial_number,
+            mac_address=mac,
+            ltk_hex=ltk_hex,
+            account_uuid=account_uuid,
+            ble_proxy=ble_proxy,
+            state_callback=self._handle_state_update,
+            on_mac_resolved=self._on_ble_mac_resolved,
+        )
+
+        # The device calls us back directly.  It still fires
+        # EVENT_BLE_STATE_CHANGE for user automations (documented), but the
+        # coordinator no longer subscribes to it: doing so meant every BLE
+        # coordinator woke for every other BLE device's update just to discard
+        # it on a serial-number check.
+
+        _LOGGER.info(
+            "BLE vacuum coordinator setup complete for %s "
+            "(MAC: %s, LTK configured: %s, requested proxy: %s) — starting connection task. "
+            "Note: proxy pinning is stored for future use; connections currently go through "
+            "the default HA Bluetooth route.",
+            self.serial_number,
+            mac,
+            bool(ltk_hex),
+            ble_proxy or "none",
+        )
+
+        self._stop_event.clear()
+        self._ble_task = self.hass.async_create_background_task(
+            self._ble_lifecycle_task(),
+            name=f"dyson-ble-vacuum-{self.serial_number}",
+        )
+
+        # The cloud firmware check is plain HTTP and has nothing to do with
+        # Bluetooth, so it runs on its own timer.  Hanging it off a successful
+        # BLE connect would mean a stable link never re-checks (it sits in the
+        # keepalive loop for days) and an unreachable vacuum never checks at
+        # all — even though neither case prevents talking to the account.
+        from homeassistant.helpers.event import async_track_time_interval
+
+        from .const import BLE_VACUUM_CLOUD_FIRMWARE_INTERVAL
+
+        if self._unsub_cloud_firmware is not None:
+            self._unsub_cloud_firmware()
+        self._unsub_cloud_firmware = async_track_time_interval(
+            self.hass,
+            self._async_cloud_firmware_tick,
+            timedelta(seconds=BLE_VACUUM_CLOUD_FIRMWARE_INTERVAL),
+        )
+        # Don't make the first answer wait for the first interval.  This must
+        # go through the tick, not the refresh directly: the refresh only fills
+        # _cloud_firmware, and entities would never see the result unless a BLE
+        # push happened to arrive afterwards.
+        self.hass.async_create_task(self._async_cloud_firmware_tick(None))
+
+    async def async_shutdown(self) -> None:
+        """Shut down the coordinator cleanly on config entry unload.
+
+        Awaiting a task we have just cancelled raises ``CancelledError`` by
+        design; that is the expected result, not a failure, so it is consumed
+        here.  Letting it propagate skipped the BLE teardown below and aborted
+        ``async_unload_entry`` before it could drop the entry data.  Cleanup
+        runs in ``finally`` so it happens on every exit path.
+        """
+        self._stop_event.set()
+        task, self._ble_task = self._ble_task, None
+        try:
+            if task is not None and not task.done():
+                task.cancel()
+                await task
+        except asyncio.CancelledError:
+            # Expected: this is the cancellation we just requested.
+            pass
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug(
+                "BLE vacuum lifecycle task for %s ended with %s: %s",
+                mask_serial(self.serial_number),
+                type(exc).__name__,
+                exc,
+            )
+        finally:
+            if self._unsub_event is not None:
+                self._unsub_event()
+                self._unsub_event = None
+            if self._unsub_cloud_firmware is not None:
+                self._unsub_cloud_firmware()
+                self._unsub_cloud_firmware = None
+            if self.ble_device is not None:
+                await self.ble_device.disconnect()
+
+    async def _ble_lifecycle_task(self) -> None:
+        """Long-lived task managing the connect/reconnect loop."""
+        from .const import BLE_VACUUM_KEEPALIVE_INTERVAL, BLE_VACUUM_RECONNECT_DELAYS
+
+        _LOGGER.info(
+            "BLE vacuum lifecycle task started for %s", mask_serial(self.serial_number)
+        )
+        attempt = 0
+        while not self._stop_event.is_set():
+            if self.ble_device is None:
+                _LOGGER.warning(
+                    "BLE vacuum lifecycle: ble_device is None for %s, waiting...",
+                    mask_serial(self.serial_number),
+                )
+                await asyncio.sleep(5)
+                continue
+
+            try:
+                _LOGGER.info(
+                    "BLE vacuum lifecycle: connecting to %s (attempt %d)",
+                    mask_serial(self.serial_number),
+                    attempt + 1,
+                )
+                await self.ble_device.connect_and_authenticate()
+                attempt = 0
+                # Product info only arrives after authentication, long after
+                # the entities (and therefore the device registry entry) were
+                # created — push it into the registry now.
+                self._update_device_registry()
+                while not self._stop_event.is_set() and self.ble_device.is_connected:
+                    await asyncio.sleep(BLE_VACUUM_KEEPALIVE_INTERVAL)
+                    if self.ble_device.is_connected:
+                        await self.ble_device.poll_state()
+                _LOGGER.info(
+                    "BLE vacuum lifecycle: %s left keepalive loop (connected: %s)",
+                    mask_serial(self.serial_number),
+                    self.ble_device.is_connected,
+                )
+            except asyncio.CancelledError:
+                _LOGGER.debug(
+                    "BLE vacuum lifecycle task cancelled for %s",
+                    mask_serial(self.serial_number),
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "BLE vacuum lifecycle: connection error for %s (%s: %s)",
+                    mask_serial(self.serial_number),
+                    type(exc).__name__,
+                    exc,
+                )
+                # Ensure the device is actually disconnected before the next
+                # attempt so assemblers, queues and subscribed-attribute state
+                # cannot carry over from a half-failed session.
+                if self.ble_device is not None:
+                    try:
+                        await self.ble_device.disconnect()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            if self._stop_event.is_set():
+                return
+
+            delay_index = min(attempt, len(BLE_VACUUM_RECONNECT_DELAYS) - 1)
+            delay = BLE_VACUUM_RECONNECT_DELAYS[delay_index]
+            _LOGGER.info(
+                "BLE vacuum %s disconnected; reconnecting in %ds (attempt %d)",
+                mask_serial(self.serial_number),
+                delay,
+                attempt + 1,
+            )
+            attempt += 1
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+                return
+            except asyncio.TimeoutError:
+                pass
+
+    def _candidate_account_entries(self) -> list[Any]:
+        """Return cloud accounts to try, most likely owner first.
+
+        Picking one account and giving up is wrong once a user has more than
+        one: querying an unrelated account just returns "device not found", and
+        the vacuum's real owner is never asked.  When the device entry records
+        which account it belongs to we return only that one; otherwise we
+        return every account so the caller can search them.
+        """
+        accounts = [
+            e
+            for e in self.hass.config_entries.async_entries(DOMAIN)
+            if e.data.get("auth_token")
+        ]
+        if not accounts:
+            return []
+
+        account_uuid = self._config_entry.data.get("account_uuid")
+        if account_uuid:
+            for entry in accounts:
+                if entry.data.get("account_uuid") == account_uuid:
+                    return [entry]
+
+        parent_entry_id = self._config_entry.data.get("parent_entry_id")
+        if parent_entry_id:
+            for entry in accounts:
+                if entry.entry_id == parent_entry_id:
+                    return [entry]
+
+        if len(accounts) > 1:
+            _LOGGER.debug(
+                "%s is not associated with a specific Dyson account; trying %d "
+                "configured account(s) in order",
+                mask_serial(self.serial_number),
+                len(accounts),
+            )
+        return accounts
+
+    async def _async_cloud_firmware_tick(self, _now: Any = None) -> None:
+        """Timer callback: refresh cloud firmware status and push to entities."""
+        await self._async_maybe_refresh_cloud_firmware(force=True)
+        self._publish_cloud_firmware()
+
+    def _publish_cloud_firmware(self) -> None:
+        """Push cloud firmware status to entities if they do not already have it.
+
+        Compares against the *published* coordinator data rather than the
+        previous ``_cloud_firmware``: an unchanged cloud answer that entities
+        have never received still needs publishing, which is exactly the case
+        when the first fetch lands while the vacuum is out of BLE range.
+        """
+        published = self.data if isinstance(self.data, dict) else {}
+        if self._cloud_firmware:
+            if all(published.get(k) == v for k, v in self._cloud_firmware.items()):
+                return
+            merged = dict(published)
+            merged.update(self._cloud_firmware)
+        else:
+            if not any(k in published for k in _CLOUD_FIRMWARE_KEYS):
+                return
+            merged = {
+                k: v for k, v in published.items() if k not in _CLOUD_FIRMWARE_KEYS
+            }
+        self.async_set_updated_data(merged)
+
+    async def _async_maybe_refresh_cloud_firmware(self, force: bool = False) -> None:
+        """Ask the Dyson cloud whether newer firmware exists, at most twice a day.
+
+        A ``lecOnly`` vacuum has no internet, so it cannot know whether a newer
+        build has been released — it only knows whether the phone app has staged
+        one on it.  The account API does know: ``Firmware.new_version_available``
+        plus ``get_pending_release()``.  Verified to be populated for BLE-only
+        devices (``connected_configuration`` is present with ``mqtt=None``).
+
+        Failures are non-fatal: without an account, or on any API error, the
+        update entity simply keeps reporting *unknown* rather than guessing.
+        """
+        from .const import BLE_VACUUM_CLOUD_FIRMWARE_INTERVAL
+
+        now = self.hass.loop.time()
+        if (
+            not force
+            and self._cloud_firmware
+            and now - self._cloud_firmware_checked_at
+            < BLE_VACUUM_CLOUD_FIRMWARE_INTERVAL
+        ):
+            return
+
+        entries = self._candidate_account_entries()
+        if not entries:
+            _LOGGER.debug(
+                "No Dyson cloud account configured; firmware status for %s stays "
+                "unknown (the machine itself cannot tell us)",
+                mask_serial(self.serial_number),
+            )
+            self._cloud_firmware = {}
+            return
+
+        for entry in entries:
+            info = await self._async_fetch_cloud_firmware(entry)
+            if info is None:
+                continue
+            self._cloud_firmware = info
+            self._cloud_firmware_checked_at = now
+            _LOGGER.info(
+                "Cloud firmware status for %s: installed %s, newer available: %s",
+                mask_serial(self.serial_number),
+                info["cloud_firmware_version"],
+                info["cloud_new_version_available"],
+            )
+            return
+        _LOGGER.debug(
+            "%s was not found on any configured Dyson account; firmware status "
+            "stays unknown",
+            mask_serial(self.serial_number),
+        )
+        self._cloud_firmware = {}
+
+    async def _async_fetch_cloud_firmware(self, entry: Any) -> dict[str, Any] | None:
+        """Read firmware status for this vacuum from one cloud account.
+
+        Returns:
+            The firmware info dict, or ``None`` when this account does not know
+            the device (so the caller can try the next one) or the lookup fails.
+        """
+        client = None
+        try:
+            client = AsyncDysonClient(
+                email=entry.data.get("email"),
+                auth_token=entry.data.get("auth_token"),
+                country=entry.data.get(CONF_COUNTRY, "US"),
+                culture=entry.data.get(CONF_CULTURE, "en-US"),
+            )
+            devices = await client.get_devices()
+            record = next(
+                (
+                    d
+                    for d in devices
+                    if getattr(d, "serial_number", None) == self.serial_number
+                ),
+                None,
+            )
+            if record is None:
+                _LOGGER.debug(
+                    "%s not present on this Dyson account; trying the next one",
+                    mask_serial(self.serial_number),
+                )
+                return None
+            config = getattr(record, "connected_configuration", None)
+            firmware = getattr(config, "firmware", None) if config else None
+            if firmware is None:
+                _LOGGER.debug(
+                    "Cloud record for %s carries no firmware block",
+                    mask_serial(self.serial_number),
+                )
+                return None
+
+            info: dict[str, Any] = {
+                "cloud_firmware_version": getattr(firmware, "version", None),
+                "cloud_new_version_available": bool(
+                    getattr(firmware, "new_version_available", False)
+                ),
+                "cloud_auto_update_enabled": bool(
+                    getattr(firmware, "auto_update_enabled", False)
+                ),
+                "cloud_pending_version": None,
+            }
+            try:
+                pending = await client.get_pending_release(self.serial_number)
+                if pending is not None:
+                    info["cloud_pending_version"] = getattr(pending, "version", None)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Pending-release lookup failed for %s: %s",
+                    mask_serial(self.serial_number),
+                    exc,
+                )
+            return info
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug(
+                "Could not read cloud firmware status for %s: %s",
+                mask_serial(self.serial_number),
+                exc,
+            )
+            return None
+        finally:
+            if client is not None:
+                close = getattr(client, "close", None)
+                if close is not None:
+                    try:
+                        await close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    def _update_device_registry(self) -> None:
+        """Write firmware / hardware details into the HA device registry.
+
+        ``DeviceInfo`` is evaluated once, when entities are first added — which
+        happens before the background BLE session has authenticated and parsed
+        Product Info.  Without this the device page shows no firmware or
+        hardware version for the life of the entry.
+        """
+        if self.ble_device is None:
+            return
+        state = self.ble_device.state
+        updates: dict[str, Any] = {}
+        if self.ble_device.firmware_version:
+            updates["sw_version"] = self.ble_device.firmware_version
+        if state.hardware_module:
+            updates["model_id"] = state.hardware_module
+            updates["hw_version"] = (
+                f"{state.hardware_module}/{state.hardware_variant}"
+                if state.hardware_variant
+                else state.hardware_module
+            )
+        if not updates:
+            return
+        try:
+            from homeassistant.helpers import device_registry as dr
+
+            registry = dr.async_get(self.hass)
+            # async_get_device() is deprecated (identifiers are only unique
+            # within a config entry) and is removed in HA 2027.8.
+            device = registry.async_get_device_by_identifier(
+                (DOMAIN, self.serial_number), self._config_entry.entry_id
+            )
+            if device is None:
+                return
+            registry.async_update_device(device.id, **updates)
+            _LOGGER.debug(
+                "Updated device registry for %s: %s",
+                mask_serial(self.serial_number),
+                updates,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug(
+                "Could not update device registry for %s: %s",
+                mask_serial(self.serial_number),
+                exc,
+            )
+
+    @callback
+    def _handle_state_update(self, payload: dict[str, Any]) -> None:
+        """Receive a state snapshot straight from the BLE device.
+
+        Called by :class:`.ble_vacuum.DysonBleVacuumDevice` rather than routed
+        through the event bus, so there is no cross-device filtering and the
+        payload is not re-parsed from an ``Event``.
+        """
+        state_dict = {k: v for k, v in payload.items() if k != "serial_number"}
+        # A BLE push carries only BLE state, so publishing it verbatim would
+        # drop the cloud firmware fields merged in by _publish_cloud_firmware.
+        # Pushes arrive every few seconds and the cloud is re-checked every 12
+        # hours, so without this the cloud answer is visible for an instant and
+        # then gone for half a day.
+        if self._cloud_firmware:
+            state_dict.update(self._cloud_firmware)
+        self.async_set_updated_data(state_dict)
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Return current data (no-op; data is pushed by the device)."""
+        return self.data or {}
+
+    @property
+    def is_connected(self) -> bool:
+        """Return True if connected and authenticated."""
+        return self.ble_device is not None and self.ble_device.is_connected
+
+    @property
+    def firmware_version(self) -> str | None:
+        """Return firmware version when known."""
+        if self.ble_device is None:
+            return None
+        return self.ble_device.firmware_version

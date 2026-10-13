@@ -1,0 +1,1721 @@
+"""BLE device wrapper for Dyson BLE-only lights (e.g. Lightcycle Morph CD06).
+
+This module implements the BLE transport layer for Dyson lights that communicate
+exclusively over Bluetooth Low Energy.  It handles:
+
+- GATT connection via Home Assistant's bluetooth integration (wrapping bleak)
+- Dyson message framing (fragment assembler / builder — reverse-engineered from
+  the MyDyson Android app by S-Termi, discussion #334)
+- LTK silent re-auth (HKDF-SHA256 + AES-128-CBC + HMAC-SHA256)
+- GATT characteristic subscriptions (power, brightness, color temperature, motion)
+- State change propagation via the Home Assistant event bus
+  (``EVENT_BLE_STATE_CHANGE``) — *no MQTT*
+
+The crypto implementation faithfully mirrors the Android app's ``g20/a.java``
+and ``g20/c.java`` classes as documented in S-Termi's reverse-engineering notes.
+
+Note on PROTOCOL.md terminology
+--------------------------------
+The :file:`docs/PROTOCOL.md` file bundled with S-Termi's archive describes the
+crypto as "AES-GCM".  The actual implementation (``g20/c.java``) uses
+**AES-128-CBC + HMAC-SHA256** (Encrypt-then-MAC).  This module implements
+the actual algorithm, not the summary description.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import logging
+import math
+import os
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
+
+# Lazy-import homeassistant.components.bluetooth inside methods to avoid
+# importing the HA bluetooth stack (which pulls in aiousbwatcher, etc.) at
+# module level — this allows tests to import ble_device without the full HA
+# environment installed.
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+
+from .const import (
+    BLE_AUTH_CHAR_UUID,
+    BLE_BRIGHTNESS_LUMENS_MAX,
+    BLE_BRIGHTNESS_LUMENS_MIN,
+    BLE_BRIGHTNESS_LUMENS_UUID,
+    BLE_BRIGHTNESS_UUID,
+    BLE_CHAR_11006_UUID,
+    BLE_CHAR_11007_UUID,
+    BLE_COLOR_TEMP_UUID,
+    BLE_DAYLIGHT_MODE_DISABLE_PAYLOAD,
+    BLE_DAYLIGHT_MODE_ENABLE_PAYLOAD,
+    BLE_HKDF_INFO,
+    BLE_MAX_KELVIN,
+    BLE_MIN_KELVIN,
+    BLE_MOTION_UUID,
+    BLE_MSG_TYPE_CONNECTION_ESTABLISHED,
+    BLE_MSG_TYPE_PRODUCT_INFO,
+    BLE_MSG_TYPE_REAUTH_PAYLOAD_A,
+    BLE_MSG_TYPE_REAUTH_PAYLOAD_B,
+    BLE_MSG_TYPE_REAUTH_PAYLOAD_C,
+    BLE_MSG_TYPE_REQUEST_PRODUCT_INFO,
+    BLE_POWER_UUID,
+    BLE_WRITE_ATTR_CHAR_UUID,
+    DOMAIN,
+    EVENT_BLE_STATE_CHANGE,
+)
+from .device_utils import mask_serial
+
+_LOGGER = logging.getLogger(__name__)
+
+# BLE fragment default capacity (matches Dyson Android app default)
+_FRAGMENT_CAPACITY = 20
+
+# Reconnection backoff delays in seconds
+_RECONNECT_DELAYS = [5, 15, 30, 60]
+
+# Keepalive poll interval in seconds
+_KEEPALIVE_INTERVAL = 20.0
+
+# Treat consecutive manual light adjustments as one interaction. The lamp does
+# not expose a decoded daylight-mode notification, so a later interaction must
+# reassert manual mode in case the physical daylight button was pressed.
+_MANUAL_MODE_SESSION_SECONDS = 1.0
+
+# Maximum auth handshake attempts before giving up on a connection.
+# Each attempt resends PayloadA (0x06) with a fresh nonce and waits for
+# PayloadB (0x07).  With low-duty-cycle BLE scan windows (e.g. the
+# esp32_ble_tracker default of 30ms), PayloadB packets are sometimes dropped
+# in transit through the proxy; retrying gives the device a chance to
+# regenerate and retransmit without a full reconnect.
+_MAX_AUTH_ATTEMPTS = 3
+
+
+# ── Dyson Message Framing ─────────────────────────────────────────────────────
+
+
+@dataclass
+class DysonMessage:
+    """A reassembled logical BLE message from the Dyson protocol."""
+
+    type_id: int
+    payload: bytes
+
+
+class DysonFragmentAssembler:
+    """Reassemble Dyson's first-byte-fragment-header BLE messages.
+
+    The Dyson BLE protocol fragments logical messages across multiple GATT
+    writes/notifications.  Each fragment carries a header byte that encodes
+    whether it is the first fragment (high bit set) and the total or current
+    fragment count in the lower 7 bits.
+
+    Source: reverse-engineered from ``g20/a.java`` (Android Smali).
+    """
+
+    def __init__(self) -> None:
+        """Initialise the assembler."""
+        self._buffer = bytearray()
+        self._expected_fragments = 0
+        self._received_fragments = 0
+        self._type_id = 0
+
+    def reset(self) -> None:
+        """Reset internal state, discarding any partial message."""
+        self._buffer.clear()
+        self._expected_fragments = 0
+        self._received_fragments = 0
+        self._type_id = 0
+
+    def feed(self, fragment: bytes) -> DysonMessage | None:
+        """Feed a raw GATT fragment.
+
+        Args:
+            fragment: Raw bytes received from the GATT characteristic.
+
+        Returns:
+            A :class:`DysonMessage` when a complete message has been assembled,
+            or ``None`` when more fragments are expected.
+
+        Raises:
+            ValueError: If the first fragment is too short to be valid.
+        """
+        if not fragment:
+            return None
+
+        header = fragment[0]
+        is_first = bool(header & 0x80)
+
+        if is_first:
+            if len(fragment) < 2:  # noqa: PLR2004
+                raise ValueError(
+                    f"first Dyson fragment too short: {len(fragment)} bytes"
+                )
+            self._buffer.clear()
+            self._expected_fragments = (header & 0x7F) + 1
+            self._received_fragments = 1
+            self._type_id = fragment[1]
+            self._buffer.extend(fragment[2:])
+        else:
+            if self._expected_fragments == 0:
+                return None
+            self._received_fragments = (header & 0x7F) + 1
+            self._buffer.extend(fragment[1:])
+
+        if (
+            self._expected_fragments
+            and self._received_fragments == self._expected_fragments
+        ):
+            message = DysonMessage(self._type_id, bytes(self._buffer))
+            self.reset()
+            return message
+
+        return None
+
+
+def fragment_dyson_message(
+    type_id: int, payload: bytes, capacity: int = _FRAGMENT_CAPACITY
+) -> list[bytes]:
+    """Fragment a logical Dyson message into BLE frames.
+
+    The logical message layout is ``[type_byte][payload]``, then split into
+    chunks of ``capacity - 1`` bytes each (one byte reserved for the header).
+
+    Args:
+        type_id: Message type byte (one of ``BLE_MSG_TYPE_*`` constants).
+        payload: Raw message payload bytes.
+        capacity: Maximum bytes per BLE frame (default 20, Dyson app default).
+
+    Returns:
+        List of raw fragment byte strings ready to write to the GATT char.
+
+    Raises:
+        ValueError: If ``capacity < 2`` or the message is too long to fragment.
+    """
+    if capacity < 2:  # noqa: PLR2004
+        raise ValueError("fragment capacity must be at least 2")
+
+    logical = bytes([type_id]) + payload
+    data_per_fragment = capacity - 1
+    total_fragments = max(1, math.ceil(len(logical) / data_per_fragment))
+    if total_fragments > 128:  # noqa: PLR2004
+        raise ValueError(
+            f"message too long to fragment (would need {total_fragments} fragments)"
+        )
+
+    fragments: list[bytes] = []
+    for index in range(total_fragments):
+        start = index * data_per_fragment
+        chunk = logical[start : start + data_per_fragment]
+        header = (0x80 | (total_fragments - 1)) if index == 0 else (index & 0x7F)
+        fragments.append(bytes([header]) + chunk)
+
+    return fragments
+
+
+# ── Cryptography ──────────────────────────────────────────────────────────────
+
+
+def hkdf_derive_aes_key(ltk: bytes) -> bytes:
+    """Derive a 16-byte AES key from the Long Term Key.
+
+    Implements the HKDF-SHA256 with empty salt as used in the Android app
+    ``g20/b.d``, producing one SHA-256 expand block truncated to 16 bytes.
+
+    Args:
+        ltk: Long Term Key bytes obtained from Dyson cloud during fresh pairing.
+
+    Returns:
+        16-byte AES key suitable for AES-128-CBC operations.
+    """
+    prk = hmac.new(b"", ltk, hashlib.sha256).digest()
+    block1 = hmac.new(prk, BLE_HKDF_INFO + b"\x01", hashlib.sha256).digest()
+    return block1[:16]
+
+
+def _aes_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
+    """AES-128-CBC encrypt (no padding — plaintext must be block-aligned)."""
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    return encryptor.update(plaintext) + encryptor.finalize()
+
+
+def _aes_cbc_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
+    """AES-128-CBC decrypt (no padding — ciphertext must be block-aligned)."""
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    return decryptor.update(ciphertext) + decryptor.finalize()
+
+
+def g20c_decrypt(enc_key: bytes, envelope: bytes) -> bytes | None:
+    """Decrypt a g20c envelope and return the plaintext.
+
+    Verifies HMAC-SHA256 before decrypting to detect wrong keys early.
+    Mirrors the inverse of :func:`g20c_encrypt`.
+
+    The envelope layout is always ``IV(16) + CT(16) + MAC(32)`` = 64 bytes,
+    matching the fixed output of :func:`g20c_encrypt` for a 16-byte plaintext.
+
+    Args:
+        enc_key: 16-byte AES key derived from :func:`hkdf_derive_aes_key`.
+        envelope: g20c envelope bytes (must be exactly 64 bytes).
+
+    Returns:
+        Decrypted plaintext bytes, or ``None`` if MAC verification fails
+        (wrong key, corrupted data, or wrong length).
+    """
+    # Expected: IV(16) + CT(16) + MAC(32) = exactly 64 bytes
+    if len(envelope) != 64:  # noqa: PLR2004
+        return None
+    iv = envelope[:16]
+    ct = envelope[16:32]
+    mac = envelope[32:64]
+    expected_mac = hmac.new(enc_key, ct, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+    return _aes_cbc_decrypt(enc_key, iv, ct)
+
+
+def g20c_encrypt(enc_key: bytes, plaintext: bytes) -> bytes:
+    """Encrypt using Dyson's g20c scheme: IV(16) + AES-CBC(16) + HMAC-SHA256(32).
+
+    This is Encrypt-then-MAC (not AES-GCM).  Mirrors ``g20/c.a()`` in the
+    Android app.  Total output is always 64 bytes for a 16-byte plaintext.
+
+    Args:
+        enc_key: 16-byte AES key derived from :func:`hkdf_derive_aes_key`.
+        plaintext: 16-byte plaintext block (e.g. a random nonce or challenge).
+
+    Returns:
+        64-byte ciphertext envelope: ``IV(16) + CT(16) + MAC(32)``.
+    """
+    iv = os.urandom(16)
+    ct = _aes_cbc_encrypt(enc_key, iv, plaintext)
+    mac = hmac.new(enc_key, ct, hashlib.sha256).digest()
+    return iv + ct + mac
+
+
+def build_reauth_payload_a(account_uuid: str, enc_key: bytes, nonce: bytes) -> bytes:
+    """Build the 82-byte LTK re-auth PayloadA (message type 0x06).
+
+    Layout: ``account_guid(16) || 0x00 0x00 || g20c_encrypt(enc_key, nonce)``
+
+    Args:
+        account_uuid: Dyson account UUID string (e.g. ``"xxxxxxxx-xxxx-..."``).
+        enc_key: Derived AES key from :func:`hkdf_derive_aes_key`.
+        nonce: 16 random bytes generated fresh for each auth attempt.
+
+    Returns:
+        82-byte payload.
+    """
+    return UUID(account_uuid).bytes + b"\x00\x00" + g20c_encrypt(enc_key, nonce)
+
+
+def build_reauth_payload_c(enc_key: bytes, challenge: bytes) -> bytes:
+    """Build the 66-byte LTK re-auth PayloadC (message type 0x08).
+
+    Layout: ``0x00 0x00 || g20c_encrypt(enc_key, challenge)``
+
+    Args:
+        enc_key: Derived AES key from :func:`hkdf_derive_aes_key`.
+        challenge: Challenge bytes extracted from the lamp's PayloadB (0x07).
+
+    Returns:
+        66-byte payload.
+    """
+    return b"\x00\x00" + g20c_encrypt(enc_key, challenge)
+
+
+# ── Value scaling ─────────────────────────────────────────────────────────────
+
+
+def ha_to_raw_brightness(ha_brightness: int) -> int:
+    """Map Home Assistant brightness (0-255) to lamp percent (1-100).
+
+    The minimum raw value is 1 to prevent ambiguity with the power-off state.
+
+    Args:
+        ha_brightness: HA brightness value in range 0–255.
+
+    Returns:
+        Lamp brightness percent in range 1–100.
+    """
+    if ha_brightness <= 0:
+        return 1
+    return max(1, min(100, round(ha_brightness * 100 / 255)))
+
+
+def raw_to_ha_brightness(raw: int) -> int:
+    """Map lamp percent (0-100) to Home Assistant brightness (0-255).
+
+    Args:
+        raw: Lamp brightness percent in range 0–100.
+
+    Returns:
+        HA brightness value in range 0–255.
+    """
+    return max(0, min(255, round(raw * 255 / 100)))
+
+
+def ha_to_raw_brightness_lumens(ha_brightness: int) -> int:
+    """Map Home Assistant brightness (0-255) to lamp lumens (100-1000).
+
+    Used for daylight-capable devices (e.g. CF06 / CD06 Lightcycle Morph)
+    that store brightness in characteristic 11009 as a uint16 LE lumens value.
+
+    The mapping is linear over the range
+    ``BLE_BRIGHTNESS_LUMENS_MIN``–``BLE_BRIGHTNESS_LUMENS_MAX``.
+
+    Args:
+        ha_brightness: HA brightness value in range 0–255.
+
+    Returns:
+        Lamp brightness in lumens, range 100–1000.
+    """
+    if ha_brightness <= 0:
+        return BLE_BRIGHTNESS_LUMENS_MIN
+    lm_range = BLE_BRIGHTNESS_LUMENS_MAX - BLE_BRIGHTNESS_LUMENS_MIN
+    return max(
+        BLE_BRIGHTNESS_LUMENS_MIN,
+        min(
+            BLE_BRIGHTNESS_LUMENS_MAX,
+            round(BLE_BRIGHTNESS_LUMENS_MIN + ha_brightness * lm_range / 255),
+        ),
+    )
+
+
+def raw_lumens_to_ha_brightness(lumens: int) -> int:
+    """Map lamp lumens (100-1000) to Home Assistant brightness (0-255).
+
+    Inverse of :func:`ha_to_raw_brightness_lumens`.
+
+    Args:
+        lumens: Lamp brightness in lumens, range 100–1000.
+
+    Returns:
+        HA brightness value in range 0–255.
+    """
+    lm_range = BLE_BRIGHTNESS_LUMENS_MAX - BLE_BRIGHTNESS_LUMENS_MIN
+    return max(
+        0, min(255, round((lumens - BLE_BRIGHTNESS_LUMENS_MIN) * 255 / lm_range))
+    )
+
+
+def kelvin_to_mired(kelvin: int) -> int:
+    """Convert Kelvin to mired (reciprocal megakelvin).
+
+    Args:
+        kelvin: Color temperature in Kelvin.
+
+    Returns:
+        Color temperature in mired, rounded to nearest integer.
+    """
+    if kelvin <= 0:
+        return round(1_000_000 / BLE_MIN_KELVIN)  # safe default: warmest white
+    return round(1_000_000 / kelvin)
+
+
+def mired_to_kelvin(mired: int) -> int:
+    """Convert mired to Kelvin, clamped to lamp range.
+
+    Args:
+        mired: Color temperature in mired.
+
+    Returns:
+        Color temperature in Kelvin, clamped to [BLE_MIN_KELVIN, BLE_MAX_KELVIN].
+    """
+    if mired <= 0:
+        return BLE_MAX_KELVIN  # safe default: coolest white
+    kelvin = round(1_000_000 / mired)
+    return max(BLE_MIN_KELVIN, min(BLE_MAX_KELVIN, kelvin))
+
+
+# ── DysonBLEDevice ────────────────────────────────────────────────────────────
+
+
+@dataclass
+class BLELightState:
+    """Current state snapshot of a Dyson BLE light."""
+
+    connected: bool = False
+    authenticated: bool = False
+    power: bool | None = None
+    brightness_raw: int | None = None  # 0-100 lamp percent
+    brightness: int | None = None  # 0-255 HA scale
+    color_temp_kelvin: int | None = None
+    color_temp_mired: int | None = None
+    daylight_mode: bool | None = None  # None = unknown, True = auto, False = manual
+    motion_detected: bool = False
+    last_motion_at: float = 0.0
+    char_11006_hex: str | None = None
+    char_11007_hex: str | None = None
+    last_error: str = ""
+    firmware_major: int | None = None
+    firmware_minor: int | None = None
+    firmware_build: int | None = None
+
+
+class DysonBLEDevice:
+    """BLE transport layer for a Dyson BLE-only light.
+
+    Manages the full lifecycle of a Bluetooth connection to a Dyson Lightcycle
+    Morph (or compatible device):
+
+    1. Scan/connect using Home Assistant's bluetooth integration
+    2. Authenticate using stored LTK via the silent re-auth flow
+    3. Read initial state from GATT characteristics
+    4. Subscribe to runtime notifications (motion, flags)
+    5. Fire :const:`.const.EVENT_BLE_STATE_CHANGE` on every state update
+    6. Reconnect with exponential backoff on disconnect
+
+    Commands (:meth:`set_power`, :meth:`set_brightness`,
+    :meth:`set_color_temp_kelvin`) write directly to GATT characteristics
+    and then read back state to update the event bus.
+
+    Attributes:
+        serial_number: Dyson device serial number.
+        mac_address: BLE MAC address of the lamp (``AA:BB:CC:DD:EE:FF``).
+        ltk_hex: Long Term Key hex string from Dyson cloud pairing.
+        account_uuid: Dyson account UUID for constructing auth payloads.
+        state: Current :class:`BLELightState` snapshot.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        serial_number: str,
+        mac_address: str,
+        ltk_hex: str,
+        account_uuid: str,
+        ble_proxy: str | None = None,
+        daylight_capable: bool = True,
+        on_mac_resolved: Callable[[str], None] | None = None,
+    ) -> None:
+        """Initialise the BLE device wrapper.
+
+        Args:
+            hass: Home Assistant instance.
+            serial_number: Dyson device serial number.
+            mac_address: BLE MAC address (``AA:BB:CC:DD:EE:FF``).
+            ltk_hex: Long Term Key as a hex string.
+            account_uuid: Dyson account UUID string.
+            ble_proxy: Optional pinned Bluetooth proxy host (future use).
+            daylight_capable: Whether this device uses characteristic 11009 in
+                lumens rather than characteristic 11000 in percent.
+            on_mac_resolved: Optional callback invoked with a newly
+                rediscovered MAC address when the configured one is no longer
+                advertising (e.g. after a Bluetooth address rotation), so the
+                caller can persist it for future reconnects.
+        """
+        self.hass = hass
+        self.serial_number = serial_number
+        self.mac_address = mac_address.upper()
+        self._ltk_hex = ltk_hex
+        self._account_uuid = account_uuid
+        self._ble_proxy = ble_proxy
+        self._daylight_capable = daylight_capable
+        self._on_mac_resolved = on_mac_resolved
+        self._manual_mode_valid_until = 0.0
+
+        self.state = BLELightState()
+        self._client: Any | None = None  # BleakClient at runtime
+        self._assembler = DysonFragmentAssembler()
+        self._message_queue: asyncio.Queue[DysonMessage] = asyncio.Queue()
+        self._lock = asyncio.Lock()
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _fire_state_change(self) -> None:
+        """Publish current state on the HA event bus."""
+        import dataclasses
+
+        self.hass.bus.async_fire(
+            EVENT_BLE_STATE_CHANGE,
+            {
+                "serial_number": self.serial_number,
+                **dataclasses.asdict(self.state),
+            },
+        )
+
+    def _on_auth_notification(self, _characteristic: Any, data: bytearray) -> None:
+        """Handle raw notification from the auth characteristic (11011)."""
+        fragment = bytes(data)
+        try:
+            message = self._assembler.feed(fragment)
+        except ValueError as exc:
+            _LOGGER.warning(
+                "BLE fragment error for %s: %s", mask_serial(self.serial_number), exc
+            )
+            self._assembler.reset()
+            return
+
+        if message is not None:
+            _LOGGER.debug(
+                "BLE message type=0x%02X len=%d from %s",
+                message.type_id,
+                len(message.payload),
+                self.serial_number,
+            )
+            self._message_queue.put_nowait(message)
+
+    def _on_motion_notification(self, _characteristic: Any, data: bytearray) -> None:
+        """Handle notification from the motion characteristic (11008)."""
+        raw = bytes(data)
+        motion = raw != bytes(len(raw))
+        import time
+
+        if motion:
+            self.state.last_motion_at = time.time()
+        self.state.motion_detected = motion
+        self._fire_state_change()
+
+    def _on_power_notification(self, _characteristic: Any, data: bytearray) -> None:
+        """Handle notification from the power characteristic.
+
+        Called when the lamp reports a power-state change (e.g. physical button
+        press).  Updates cached state and fires to HA entities.
+        """
+        raw = bytes(data)
+        power_on = bool(raw and raw[0] != 0)
+        _LOGGER.debug(
+            "Power notification from %s: raw=%s → %s",
+            self.serial_number,
+            raw.hex(),
+            "ON" if power_on else "OFF",
+        )
+        self.state.power = power_on
+        self._fire_state_change()
+
+    def _on_brightness_notification(
+        self, _characteristic: Any, data: bytearray
+    ) -> None:
+        """Handle notification from the device's brightness characteristic."""
+        raw = bytes(data)
+        _LOGGER.debug(
+            "Brightness notification from %s: raw=%s (%d bytes)",
+            self.serial_number,
+            raw.hex(),
+            len(raw),
+        )
+        if self._daylight_capable and len(raw) >= 2:  # noqa: PLR2004
+            lumens = int.from_bytes(raw[:2], byteorder="little")
+            ha_brightness = raw_lumens_to_ha_brightness(lumens)
+            _LOGGER.debug(
+                "Brightness update for %s: %d lm → HA brightness %d",
+                self.serial_number,
+                lumens,
+                ha_brightness,
+            )
+            self.state.brightness_raw = lumens
+            self.state.brightness = ha_brightness
+            self._fire_state_change()
+        elif not self._daylight_capable and raw:
+            percent = max(0, min(100, raw[0]))
+            self.state.brightness_raw = percent
+            self.state.brightness = raw_to_ha_brightness(percent)
+            self._fire_state_change()
+        else:
+            _LOGGER.warning(
+                "Brightness notification from %s has unexpected length %d (raw=%s); "
+                "expected at least 2 bytes — value format may differ from assumption",
+                self.serial_number,
+                len(raw),
+                raw.hex(),
+            )
+
+    @property
+    def _brightness_uuid(self) -> str:
+        """Return the brightness characteristic for this device."""
+        if self._daylight_capable:
+            return BLE_BRIGHTNESS_LUMENS_UUID
+        return BLE_BRIGHTNESS_UUID
+
+    def _on_color_temp_notification(
+        self, _characteristic: Any, data: bytearray
+    ) -> None:
+        """Handle notification from the color temperature characteristic.
+
+        Called when the lamp reports a color-temperature change from its
+        physical controls.  Updates cached state and fires to HA entities.
+        """
+        raw = bytes(data)
+        _LOGGER.debug(
+            "Color temp notification from %s: raw=%s (%d bytes)",
+            self.serial_number,
+            raw.hex(),
+            len(raw),
+        )
+        if len(raw) >= 2:  # noqa: PLR2004
+            kelvin = int.from_bytes(raw[:2], byteorder="little")
+            _LOGGER.debug(
+                "Color temp update for %s: %d K",
+                self.serial_number,
+                kelvin,
+            )
+            self.state.color_temp_kelvin = kelvin
+            self.state.color_temp_mired = kelvin_to_mired(kelvin)
+            self._fire_state_change()
+        else:
+            _LOGGER.warning(
+                "Color temp notification from %s has unexpected length %d (raw=%s)",
+                self.serial_number,
+                len(raw),
+                raw.hex(),
+            )
+
+    def _on_runtime_notification(self, short_id: str):
+        """Return a notify handler for a runtime diagnostic characteristic."""
+
+        def _handler(_characteristic: Any, data: bytearray) -> None:
+            hex_value = bytes(data).hex()
+            setattr(self.state, f"char_{short_id}_hex", hex_value)
+            self._fire_state_change()
+
+        return _handler
+
+    def _on_bleak_disconnect(self, client: Any) -> None:  # noqa: ARG002
+        """Handle unexpected BLE disconnect (called by bleak_retry_connector).
+
+        Registered as the ``disconnected_callback`` when
+        :func:`bleak_retry_connector.establish_connection` is used.  The
+        coordinator's keepalive loop will detect the disconnection via
+        :attr:`is_connected` and trigger a reconnect with backoff.
+        """
+        _LOGGER.info(
+            "BLE device %s (%s) unexpectedly disconnected",
+            self.serial_number,
+            self.mac_address,
+        )
+        self.state.connected = False
+        self.state.authenticated = False
+        self.state.daylight_mode = None
+        self._manual_mode_valid_until = 0.0
+        self._client = None
+        self._fire_state_change()
+
+    async def _wait_for_type(self, type_id: int, timeout: float = 10.0) -> DysonMessage:
+        """Wait for a specific message type from the auth characteristic."""
+        end = self.hass.loop.time() + timeout
+        # Create the get() task once so it is not orphaned on each timeout.
+        # asyncio.shield prevents wait_for from cancelling it on timeout, and
+        # we only create a new task after the old one has delivered a message.
+        get_task: asyncio.Task[DysonMessage] = asyncio.ensure_future(
+            self._message_queue.get()
+        )
+        try:
+            while True:
+                remaining = end - self.hass.loop.time()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Timed out waiting for BLE message type 0x{type_id:02X} "
+                        f"from {self.serial_number}"
+                    )
+                # Poll with a short sub-timeout so we detect disconnects quickly
+                # rather than waiting the full remaining time with an empty queue.
+                poll_timeout = min(remaining, 1.0)
+                try:
+                    msg = await asyncio.wait_for(
+                        asyncio.shield(get_task), timeout=poll_timeout
+                    )
+                except (asyncio.TimeoutError, TimeoutError):
+                    # Check if the client disconnected during the wait
+                    if self._client is None or not getattr(
+                        self._client, "is_connected", True
+                    ):
+                        raise RuntimeError(
+                            f"BLE device {self.serial_number} disconnected while "
+                            f"waiting for message type 0x{type_id:02X}"
+                        )
+                    continue  # Still connected — keep waiting
+                if msg.type_id == type_id:
+                    return msg
+                # Log at debug for known unsolicited types (e.g. 0x0B product-info
+                # push can arrive late if it was delayed by the BLE proxy past the
+                # earlier product-info wait timeout).  Warn for truly unexpected types.
+                log_fn = (
+                    _LOGGER.debug
+                    if msg.type_id == BLE_MSG_TYPE_PRODUCT_INFO
+                    else _LOGGER.warning
+                )
+                log_fn(
+                    "Unexpected BLE message type 0x%02X received while waiting for "
+                    "0x%02X from %s — discarding and continuing",
+                    msg.type_id,
+                    type_id,
+                    self.serial_number,
+                )
+                if msg.type_id == BLE_MSG_TYPE_PRODUCT_INFO:
+                    # Parse it opportunistically so firmware info stays current.
+                    self._parse_product_info(msg.payload)
+                # Wrong type — discard and wait for the next message
+                get_task = asyncio.ensure_future(self._message_queue.get())
+        finally:
+            if not get_task.done():
+                get_task.cancel()
+
+    async def _send_message(self, type_id: int, payload: bytes = b"") -> None:
+        """Fragment and write a logical message to the auth characteristic."""
+        if self._client is None:
+            raise RuntimeError("BLE client not connected")
+        fragments = fragment_dyson_message(type_id, payload)
+        for fragment in fragments:
+            await self._client.write_gatt_char(
+                BLE_AUTH_CHAR_UUID, fragment, response=False
+            )
+
+    async def _connect_via_service_info(self, service_info: Any) -> Any:
+        """Connect to a discovered ``BluetoothServiceInfoBleak`` via bleak-retry-connector.
+
+        Falls back to a raw (unconnected) ``BleakClient`` wrapping the same
+        device on failure so callers can still attempt a manual ``.connect()``.
+        """
+        from bleak import BleakClient  # provided by HA core
+
+        try:
+            from bleak_retry_connector import establish_connection
+
+            client = await establish_connection(
+                BleakClient,
+                service_info.device,
+                self.serial_number,
+                disconnected_callback=self._on_bleak_disconnect,
+                max_attempts=4,
+                # Cache the service collection after the first successful
+                # connection so reconnects skip GATT service discovery.
+                # Discovery involves many GATT reads that can hit the BLE
+                # proxy's 10-second timeout under the default esp32_ble_tracker
+                # scan parameters (window=30ms, interval=320ms).
+                use_services_cache=True,
+            )
+            _LOGGER.info(
+                "BLE connection to %s established via bleak_retry_connector",
+                self.serial_number,
+            )
+            return client  # Already connected — skip manual .connect()
+        except ImportError:
+            _LOGGER.warning(
+                "bleak_retry_connector not available for %s — "
+                "falling back to direct BleakClient (connection may be unreliable)",
+                self.serial_number,
+            )
+            return BleakClient(service_info.device)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "establish_connection() failed for %s (%s) — "
+                "falling back to direct BleakClient",
+                self.serial_number,
+                exc,
+            )
+            return BleakClient(service_info.device)
+
+    def _rescan_by_serial_name(self, _bt: Any) -> Any | None:
+        """Search all currently discovered advertisements for this serial's name.
+
+        Dyson BLE devices advertise their serial number as the BLE device
+        name, which stays stable even if the underlying MAC address changes
+        (e.g. a Bluetooth privacy/random address rotation). Used as a
+        last-resort identity match when the previously known MAC address is
+        no longer advertising.
+        """
+        for connectable in (True, False):
+            for service_info in _bt.async_discovered_service_info(
+                self.hass, connectable=connectable
+            ):
+                if (service_info.name or "").upper() == self.serial_number.upper():
+                    return service_info
+        return None
+
+    async def _get_bleak_client(self) -> Any:
+        """Obtain a connected (or connectable) BleakClient.
+
+        When the device is visible in HA's Bluetooth stack, uses
+        :func:`bleak_retry_connector.establish_connection` to return an
+        **already-connected** client with HA-recommended retry logic.  Falls
+        back to a raw ``BleakClient(mac)`` that still needs ``.connect()``.
+        """
+        from bleak import BleakClient  # provided by HA core
+
+        _LOGGER.debug(
+            "BLE client lookup for %s (MAC: %s, proxy: %s)",
+            self.serial_number,
+            self.mac_address,
+            self._ble_proxy or "none (direct adapter)",
+        )
+
+        try:
+            from homeassistant.components import bluetooth as _bt
+
+            # Log all currently discovered service infos for this MAC to aid diagnosis
+            connectable_info = _bt.async_last_service_info(
+                self.hass, self.mac_address, connectable=True
+            )
+            non_connectable_info = _bt.async_last_service_info(
+                self.hass, self.mac_address, connectable=False
+            )
+
+            if connectable_info is not None:
+                _LOGGER.info(
+                    "BLE device %s (%s) found as CONNECTABLE via adapter/proxy '%s' "
+                    "(RSSI: %s dBm) — connecting via bleak_retry_connector",
+                    self.serial_number,
+                    self.mac_address,
+                    getattr(connectable_info, "source", "unknown"),
+                    getattr(connectable_info, "rssi", "unknown"),
+                )
+                return await self._connect_via_service_info(connectable_info)
+            elif non_connectable_info is not None:
+                _LOGGER.warning(
+                    "BLE device %s (%s) is visible (RSSI: %s dBm, source: '%s') but NOT "
+                    "connectable. If using an ESPHome Bluetooth proxy, ensure it is "
+                    "configured with 'active: true' in the bluetooth_proxy component. "
+                    "Falling back to raw MAC address — connection will likely fail.",
+                    self.serial_number,
+                    self.mac_address,
+                    getattr(non_connectable_info, "rssi", "unknown"),
+                    getattr(non_connectable_info, "source", "unknown"),
+                )
+            else:
+                # The configured MAC hasn't been seen at all — it may have
+                # changed (Bluetooth privacy/random address rotation). Try to
+                # re-identify the device by its advertised name before giving up.
+                rediscovered = self._rescan_by_serial_name(_bt)
+                if rediscovered is not None:
+                    old_mac = self.mac_address
+                    self.mac_address = rediscovered.address.upper()
+                    _LOGGER.info(
+                        "BLE address rotation detected for %s: %s -> %s "
+                        "(matched by advertised name) — connecting via "
+                        "bleak_retry_connector",
+                        self.serial_number,
+                        old_mac,
+                        self.mac_address,
+                    )
+                    if self._on_mac_resolved is not None:
+                        self._on_mac_resolved(self.mac_address)
+                    return await self._connect_via_service_info(rediscovered)
+
+                scanner_count = _bt.async_scanner_count(self.hass, connectable=True)
+                _LOGGER.warning(
+                    "BLE device %s (%s) has NOT been seen by any HA Bluetooth adapter or "
+                    "proxy, and no advertisement matching its serial name was found "
+                    "(%d connectable scanner(s) registered). Check that the device is "
+                    "powered on and within range. Falling back to raw MAC address — "
+                    "connection will likely fail.",
+                    self.serial_number,
+                    self.mac_address,
+                    scanner_count,
+                )
+        except ImportError:
+            _LOGGER.warning(
+                "HA bluetooth integration not available for %s — "
+                "falling back to raw MAC address",
+                self.serial_number,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "Error querying HA bluetooth integration for %s: %s — "
+                "falling back to raw MAC address",
+                self.serial_number,
+                exc,
+            )
+        # Fall back to MAC address (works for local adapters, not proxies)
+        _LOGGER.debug(
+            "Using raw MAC address fallback for BleakClient(%s)", self.mac_address
+        )
+        return BleakClient(self.mac_address)
+
+    # ── LTK re-auth ───────────────────────────────────────────────────────────
+
+    async def _reauth_with_ltk(self) -> None:
+        """Perform silent LTK re-authentication (no button press, no cloud call).
+
+        Sends PayloadA (0x06), receives PayloadB (0x07), sends PayloadC (0x08),
+        waits for Connection Established (0x26).
+
+        Raises:
+            RuntimeError: If the client is not connected.
+            TimeoutError: If the lamp does not respond within the timeout.
+        """
+        _LOGGER.debug(
+            "LTK re-auth started for %s (LTK length: %d chars)",
+            self.serial_number,
+            len(self._ltk_hex),
+        )
+        ltk = bytes.fromhex(self._ltk_hex)
+        enc_key = hkdf_derive_aes_key(ltk)
+
+        # Request product info first (matches observed app behaviour)
+        _LOGGER.debug("Requesting product info from %s", self.serial_number)
+        await self._send_message(BLE_MSG_TYPE_REQUEST_PRODUCT_INFO)
+        try:
+            product_msg = await self._wait_for_type(
+                BLE_MSG_TYPE_PRODUCT_INFO, timeout=5.0
+            )
+            self._parse_product_info(product_msg.payload)
+            _LOGGER.debug(
+                "Product info received from %s: firmware %s.%s build %s",
+                self.serial_number,
+                self.state.firmware_major,
+                self.state.firmware_minor,
+                self.state.firmware_build,
+            )
+        except TimeoutError:
+            _LOGGER.debug(
+                "No product info response from %s (timeout); continuing with auth",
+                self.serial_number,
+            )
+
+        # Challenge-response — retry PayloadA if PayloadB is dropped by the proxy.
+        # Under the default esp32_ble_tracker scan window (30ms / 320ms interval)
+        # the proxy is idle ~91% of the time; a single PayloadB packet can be lost
+        # silently.  Resending PayloadA causes the device to regenerate PayloadB
+        # without requiring a full GATT reconnect.
+        payload_b_msg: DysonMessage | None = None
+        for auth_attempt in range(1, _MAX_AUTH_ATTEMPTS + 1):
+            nonce = os.urandom(16)  # fresh nonce per attempt
+            payload_a = build_reauth_payload_a(self._account_uuid, enc_key, nonce)
+            _LOGGER.debug(
+                "Sending PayloadA (0x06) to %s (attempt %d/%d)",
+                self.serial_number,
+                auth_attempt,
+                _MAX_AUTH_ATTEMPTS,
+            )
+            await self._send_message(BLE_MSG_TYPE_REAUTH_PAYLOAD_A, payload_a)
+
+            _LOGGER.debug(
+                "Waiting for PayloadB (0x07) from %s (attempt %d/%d)",
+                self.serial_number,
+                auth_attempt,
+                _MAX_AUTH_ATTEMPTS,
+            )
+            try:
+                payload_b_msg = await self._wait_for_type(
+                    BLE_MSG_TYPE_REAUTH_PAYLOAD_B, timeout=30.0
+                )
+                break  # Received PayloadB — proceed with auth
+            except TimeoutError:
+                if auth_attempt < _MAX_AUTH_ATTEMPTS:
+                    _LOGGER.warning(
+                        "PayloadB timeout for %s on attempt %d/%d — "
+                        "resending PayloadA (BLE packet may have been dropped by proxy)",
+                        self.serial_number,
+                        auth_attempt,
+                        _MAX_AUTH_ATTEMPTS,
+                    )
+                else:
+                    raise  # All attempts exhausted — propagate original error
+
+        assert payload_b_msg is not None  # loop always breaks or raises
+        _LOGGER.debug(
+            "PayloadB received from %s (%d bytes)",
+            self.serial_number,
+            len(payload_b_msg.payload),
+        )
+        # PayloadB layout (offsets into payload, type byte already stripped):
+        #   [0:2]   reserved 0x00 0x00
+        #   [2:18]  IV (16 bytes)
+        #   [18:50] CT (32 bytes) — AES-CBC(nonce_echo || device_challenge)
+        #   [50:82] MAC (32 bytes, optional — may be absent on some firmware)
+        # We verify the MAC when present for early LTK mismatch detection,
+        # then decrypt and take the second 16-byte block as the device challenge.
+        if len(payload_b_msg.payload) < 50:
+            raise RuntimeError(
+                f"PayloadB from {self.serial_number} is too short "
+                f"({len(payload_b_msg.payload)} bytes, need >= 50) — "
+                "possible auth rejection or firmware mismatch"
+            )
+        iv = payload_b_msg.payload[2:18]
+        ct = payload_b_msg.payload[18:50]
+        mac = payload_b_msg.payload[50:82]
+        if len(mac) == 32:
+            expected_mac = hmac.new(enc_key, ct, hashlib.sha256).digest()
+            if not hmac.compare_digest(mac, expected_mac):
+                raise RuntimeError(
+                    f"PayloadB from {self.serial_number} failed HMAC verification — "
+                    "LTK may be incorrect or corrupted"
+                )
+        dec = _aes_cbc_decrypt(enc_key, iv, ct)
+        device_nonce = dec[16:32]  # second 16-byte block = device's challenge
+        _LOGGER.debug(
+            "Decoded device challenge from %s (nonce: %s...)",
+            self.serial_number,
+            device_nonce.hex()[:8],
+        )
+
+        _LOGGER.debug("Sending PayloadC (0x08) to %s", self.serial_number)
+        payload_c = build_reauth_payload_c(enc_key, device_nonce)
+        await self._send_message(BLE_MSG_TYPE_REAUTH_PAYLOAD_C, payload_c)
+
+        _LOGGER.debug(
+            "Waiting for Connection Established (0x26) from %s", self.serial_number
+        )
+        await self._wait_for_type(BLE_MSG_TYPE_CONNECTION_ESTABLISHED, timeout=30.0)
+        _LOGGER.info(
+            "BLE LTK re-auth successful for %s", mask_serial(self.serial_number)
+        )
+
+    def _parse_product_info(self, payload: bytes) -> None:
+        """Parse product info response (type 0x0B) and update firmware fields."""
+        if len(payload) < 8:  # noqa: PLR2004
+            return
+        self.state.firmware_major = payload[0]
+        self.state.firmware_minor = payload[1]
+        self.state.firmware_build = int.from_bytes(payload[2:4], byteorder="big")
+
+    # ── GATT state read / subscribe ───────────────────────────────────────────
+
+    async def _read_initial_state(self) -> None:
+        """Read current values from all light control characteristics.
+
+        Each characteristic is read independently so that a proxy timeout on
+        one does not prevent the others from being read.  Best-effort: logs
+        debug messages on failure and does not raise.
+
+        With the default esp32_ble_tracker scan parameters (window=30ms /
+        interval=320ms), any individual GATT read may time out through a BLE
+        proxy.  Isolating each read limits the worst-case delay to one timeout
+        (≤10 s) per characteristic rather than aborting all reads on the first
+        failure.
+        """
+        if self._client is None:
+            return
+
+        # Power
+        try:
+            power_raw = bytes(await self._client.read_gatt_char(BLE_POWER_UUID))
+            self.state.power = bool(power_raw and power_raw[0] != 0)
+            _LOGGER.debug(
+                "Initial power read from %s: raw=%s → %s",
+                self.serial_number,
+                power_raw.hex(),
+                "ON" if self.state.power else "OFF",
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug(
+                "Could not read power state from %s: %s", self.serial_number, exc
+            )
+
+        # Brightness — 11009 lumens for daylight devices, 11000 percent otherwise
+        try:
+            brightness_raw = bytes(
+                await self._client.read_gatt_char(self._brightness_uuid)
+            )
+            _LOGGER.debug(
+                "Initial brightness read from %s (%s): raw=%s (%d bytes)",
+                self.serial_number,
+                self._brightness_uuid,
+                brightness_raw.hex(),
+                len(brightness_raw),
+            )
+            if self._daylight_capable and len(brightness_raw) >= 2:  # noqa: PLR2004
+                lumens = int.from_bytes(brightness_raw[:2], byteorder="little")
+                self.state.brightness_raw = lumens
+                self.state.brightness = raw_lumens_to_ha_brightness(lumens)
+                _LOGGER.debug(
+                    "Initial brightness for %s: %d lm → HA %d",
+                    self.serial_number,
+                    lumens,
+                    self.state.brightness,
+                )
+            elif not self._daylight_capable and brightness_raw:
+                percent = max(0, min(100, brightness_raw[0]))
+                self.state.brightness_raw = percent
+                self.state.brightness = raw_to_ha_brightness(percent)
+            else:
+                _LOGGER.warning(
+                    "Brightness char 11009 on %s returned %d bytes (raw=%s); "
+                    "expected uint16 LE — value format may differ from assumption",
+                    self.serial_number,
+                    len(brightness_raw),
+                    brightness_raw.hex(),
+                )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug(
+                "Could not read brightness from %s: %s", self.serial_number, exc
+            )
+
+        # Color temperature
+        try:
+            color_temp_raw = bytes(
+                await self._client.read_gatt_char(BLE_COLOR_TEMP_UUID)
+            )
+            _LOGGER.debug(
+                "Initial color temp read from %s (char 11001): raw=%s (%d bytes)",
+                self.serial_number,
+                color_temp_raw.hex(),
+                len(color_temp_raw),
+            )
+            if len(color_temp_raw) >= 2:  # noqa: PLR2004
+                kelvin = int.from_bytes(color_temp_raw[:2], byteorder="little")
+                self.state.color_temp_kelvin = kelvin
+                self.state.color_temp_mired = (
+                    kelvin_to_mired(kelvin) if kelvin > 0 else None
+                )
+                _LOGGER.debug(
+                    "Initial color temp for %s: %d K",
+                    self.serial_number,
+                    kelvin,
+                )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug(
+                "Could not read color temperature from %s: %s",
+                self.serial_number,
+                exc,
+            )
+
+    async def _enable_cccd(self, char_uuid: str) -> None:
+        """Force a characteristic's CCCD to 0x0001 (notify) after start_notify.
+
+        ESPHome Bluetooth proxies accept the notify subscription but leave the
+        client characteristic configuration descriptor at 0000, so the lamp never
+        sends anything: verified on an ESP32-C6 proxy, where the LTK handshake
+        timed out until the descriptor was written explicitly.  Direct adapters
+        already set it inside start_notify, so re-writing 0001 is a no-op there.
+
+        Args:
+            char_uuid: Characteristic whose CCCD should be enabled.
+        """
+        client = self._client
+        if client is None:
+            return
+        try:
+            characteristic = client.services.get_characteristic(char_uuid)
+        except Exception:  # noqa: BLE001 - absent cache is not fatal
+            return
+        for descriptor in getattr(characteristic, "descriptors", []):
+            if str(descriptor.uuid).lower().startswith("00002902"):
+                try:
+                    await client.write_gatt_descriptor(descriptor.handle, b"\x01\x00")
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "CCCD write for %s on %s failed: %s",
+                        char_uuid,
+                        self.serial_number,
+                        exc,
+                    )
+                return
+
+    async def _subscribe_notifications(self) -> None:
+        """Subscribe to notify characteristics for real-time updates."""
+        if self._client is None:
+            return
+
+        # Light-control characteristics: power, brightness, color temperature.
+        # The Lightcycle Morph (CF06) uses characteristic 11009 for brightness
+        # (uint16 LE lumens) rather than 11000.  Power and color temperature
+        # use their respective characteristics on all supported devices.
+        for uuid, handler, name in (
+            (BLE_POWER_UUID, self._on_power_notification, "power"),
+            (
+                self._brightness_uuid,
+                self._on_brightness_notification,
+                "brightness",
+            ),
+            (BLE_COLOR_TEMP_UUID, self._on_color_temp_notification, "color_temp"),
+        ):
+            try:
+                await self._client.start_notify(uuid, handler)
+                await self._enable_cccd(uuid)
+                _LOGGER.debug(
+                    "Subscribed to %s notifications for %s (UUID %s)",
+                    name,
+                    self.serial_number,
+                    uuid,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Could not subscribe to %s notifications for %s (UUID %s): %s "
+                    "— commands to this characteristic will not be confirmed via "
+                    "notification; state will be updated optimistically only",
+                    name,
+                    self.serial_number,
+                    uuid,
+                    exc,
+                )
+
+        # Motion notifications (most important — drives binary sensor)
+        try:
+            await self._client.start_notify(
+                BLE_MOTION_UUID, self._on_motion_notification
+            )
+            await self._enable_cccd(BLE_MOTION_UUID)
+            _LOGGER.debug(
+                "Subscribed to motion notifications for %s", self.serial_number
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "Failed to subscribe to motion characteristic for %s: %s",
+                self.serial_number,
+                exc,
+            )
+
+        # Runtime / diagnostic notifications (best-effort)
+        # Note: 11009 is now the primary brightness channel and is subscribed
+        # above; only 11006 and 11007 remain as diagnostic characteristics.
+        for short_id, uuid in (
+            ("11006", BLE_CHAR_11006_UUID),
+            ("11007", BLE_CHAR_11007_UUID),
+        ):
+            try:
+                await self._client.start_notify(
+                    uuid, self._on_runtime_notification(short_id)
+                )
+                await self._enable_cccd(uuid)
+                _LOGGER.debug(
+                    "Subscribed to diagnostic characteristic %s for %s",
+                    short_id,
+                    self.serial_number,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Could not subscribe to diagnostic characteristic %s for %s: %s",
+                    short_id,
+                    self.serial_number,
+                    exc,
+                )
+
+    # ── Public connection API ─────────────────────────────────────────────────
+
+    async def connect_and_authenticate(self) -> None:
+        """Connect to the lamp and complete LTK re-auth.
+
+        On success, :attr:`state`.``connected`` and ``authenticated`` are set
+        to :data:`True`.  The current light state is read from the device and
+        notification subscriptions are established.
+
+        Raises:
+            RuntimeError: If a BleakClient cannot be created or connection fails.
+            TimeoutError: If auth times out.
+        """
+        async with self._lock:
+            _LOGGER.info(
+                "Connecting to Dyson BLE lamp %s (MAC: %s)",
+                self.serial_number,
+                self.mac_address,
+            )
+            client = await self._get_bleak_client()
+            _LOGGER.debug(
+                "BleakClient obtained for %s: %s (already_connected: %s)",
+                self.serial_number,
+                type(client).__name__,
+                getattr(client, "is_connected", False),
+            )
+
+            if not getattr(client, "is_connected", False):
+                # Client not pre-connected — use manual retry loop (raw MAC fallback path)
+                attempts = 4
+                delay = 1.25
+                last_exc: Exception | None = None
+
+                for attempt in range(1, attempts + 1):
+                    try:
+                        _LOGGER.debug(
+                            "BLE connect attempt %d/%d for %s",
+                            attempt,
+                            attempts,
+                            self.serial_number,
+                        )
+                        await client.connect()
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        last_exc = exc
+                        _LOGGER.warning(
+                            "BLE connect attempt %d/%d failed for %s: %s: %s",
+                            attempt,
+                            attempts,
+                            self.serial_number,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        if attempt < attempts:
+                            await asyncio.sleep(delay)
+
+                if not client.is_connected:
+                    raise RuntimeError(
+                        f"Failed to connect to {self.serial_number} after {attempts} attempts: "
+                        f"{type(last_exc).__name__}: {last_exc}"
+                    ) from last_exc
+            else:
+                _LOGGER.info(
+                    "GATT connection already established for %s via bleak_retry_connector",
+                    self.serial_number,
+                )
+
+            _LOGGER.info(
+                "GATT connection established for %s — subscribing to auth characteristic",
+                self.serial_number,
+            )
+            self._client = client
+            self.state.connected = True
+            self._message_queue = asyncio.Queue()
+            self._assembler.reset()
+
+            # Subscribe to auth characteristic notifications
+            await self._client.start_notify(
+                BLE_AUTH_CHAR_UUID, self._on_auth_notification
+            )
+            await self._enable_cccd(BLE_AUTH_CHAR_UUID)
+            _LOGGER.debug(
+                "Auth characteristic notification subscription active for %s",
+                self.serial_number,
+            )
+
+            # LTK re-auth
+            try:
+                await self._reauth_with_ltk()
+            except Exception as exc:
+                _LOGGER.error(
+                    "LTK re-auth failed for %s (%s: %s) — "
+                    "verify that the LTK was correctly retrieved from the Dyson cloud",
+                    self.serial_number,
+                    type(exc).__name__,
+                    exc,
+                )
+                self.state.last_error = str(exc)
+                await self._disconnect_client()
+                raise
+
+            self.state.authenticated = True
+            self.state.last_error = ""
+            _LOGGER.info(
+                "Dyson BLE lamp %s fully connected and authenticated",
+                self.serial_number,
+            )
+
+            # Read initial state (best-effort) and subscribe to notifications.
+            # GATT reads can fail via proxy at connect time; notifications will
+            # keep state current so we proceed even if the initial read fails.
+            await self._read_initial_state()
+            await self._subscribe_notifications()
+            self._fire_state_change()
+
+    async def _disconnect_client(self) -> None:
+        """Disconnect the BleakClient, suppressing errors."""
+        client = self._client
+        self._client = None
+        if client is not None:
+            try:
+                if client.is_connected:
+                    _LOGGER.debug(
+                        "Disconnecting GATT client for %s", self.serial_number
+                    )
+                    await client.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Error during GATT disconnect for %s: %s", self.serial_number, exc
+                )
+        self.state.connected = False
+        self.state.authenticated = False
+        self.state.daylight_mode = None
+        self._manual_mode_valid_until = 0.0
+        _LOGGER.debug("GATT client disconnected for %s", self.serial_number)
+        self._fire_state_change()
+
+    async def disconnect(self) -> None:
+        """Deliberately disconnect from the lamp."""
+        async with self._lock:
+            await self._disconnect_client()
+
+    @property
+    def is_connected(self) -> bool:
+        """Return True if the lamp is connected and authenticated."""
+        return (
+            self._client is not None
+            and getattr(self._client, "is_connected", False)
+            and self.state.authenticated
+        )
+
+    # ── Command API ───────────────────────────────────────────────────────────
+
+    async def set_power(self, on: bool) -> None:
+        """Turn the lamp on or off.
+
+        Args:
+            on: :data:`True` to turn on, :data:`False` to turn off.
+
+        Raises:
+            RuntimeError: If the lamp is not connected and authenticated.
+        """
+        if not self.is_connected or self._client is None:
+            raise RuntimeError(f"{self.serial_number} is not connected")
+        async with self._lock:
+            payload = b"\x01" if on else b"\x00"
+            _LOGGER.debug(
+                "Writing power %s to %s (char 11005, payload=%s)",
+                "ON" if on else "OFF",
+                self.serial_number,
+                payload.hex(),
+            )
+            await self._client.write_gatt_char(BLE_POWER_UUID, payload, response=False)
+            # Update state optimistically from the written value.
+            # GATT reads via a BLE proxy can take several seconds each;
+            # BLE notifications will keep state current.
+            self.state.power = on
+            self._fire_state_change()
+
+    def _wants_write_request(self, char_uuid: str) -> bool:
+        """Return True only if the lamp's GATT server accepts a Write Request.
+
+        The MyDyson app uses acknowledged ATT Write Requests, but the Solarcycle
+        Morph family (E5R/E5V) advertises only ``write-without-response`` on the
+        light characteristics, so a Write Request is rejected with ATT error 0x03
+        (Write Not Permitted).  Verified on hardware (fw 5.17, product code
+        PF000552): power, brightness (11009) and colour temperature (11001) all
+        apply correctly with unacknowledged writes, so follow the device's
+        advertised properties instead of assuming the app's behaviour.
+
+        Args:
+            char_uuid: Characteristic UUID about to be written.
+
+        Returns:
+            ``True`` when the characteristic advertises the write property.
+        """
+        client = self._client
+        if client is None:
+            return False
+        try:
+            characteristic = client.services.get_characteristic(char_uuid)
+            properties = list(getattr(characteristic, "properties", None) or [])
+        except Exception:  # noqa: BLE001 - an absent service cache is not fatal here
+            return False
+        return "write" in properties
+
+    async def _disable_daylight_mode(self) -> None:
+        """Write the Daylight-Mode-disable packet to the write-attribute characteristic.
+
+        The Lightcycle Morph (CF06) runs a daylight algorithm that silently
+        ignores BLE writes to chars 11009 (brightness) and 11001 (colour
+        temperature) when in auto/daylight mode.  Writing this packet to
+        characteristic 0021 (service 0020) switches the lamp to manual mode
+        so that subsequent brightness and colour-temperature writes are applied.
+
+        Packet format (source: q90.C30568o / q90.C30554a):
+          [0x13, 0x20] = DAYLIGHT_MODE attribute ID
+          [0x01, 0x00] = value length = 1 (uint16 LE)
+          [0x00]       = false → disable daylight mode
+        """
+        if self._client is None or not self._daylight_capable:
+            return
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._manual_mode_valid_until:
+            return
+        _LOGGER.debug(
+            "Disabling daylight mode on %s (char 0021, payload=%s)",
+            self.serial_number,
+            BLE_DAYLIGHT_MODE_DISABLE_PAYLOAD.hex(),
+        )
+        await self._client.write_gatt_char(
+            BLE_WRITE_ATTR_CHAR_UUID,
+            BLE_DAYLIGHT_MODE_DISABLE_PAYLOAD,
+            # Acknowledge only when the lamp advertises the write property.
+            response=self._wants_write_request(BLE_WRITE_ATTR_CHAR_UUID),
+        )
+        self.state.daylight_mode = False
+        # The acknowledgement confirms receipt, but the lamp applies the mode
+        # transition asynchronously.  Allow it to enter manual mode before the
+        # brightness or colour-temperature write arrives.
+        await asyncio.sleep(0.2)
+        self._manual_mode_valid_until = loop.time() + _MANUAL_MODE_SESSION_SECONDS
+
+    async def set_daylight_mode(self, enabled: bool) -> None:
+        """Enable or disable the lamp’s daylight (auto) mode.
+
+        When daylight mode is **enabled** the lamp controls its own brightness
+        and colour temperature automatically based on the time of day, ambient
+        light, and user age profile.  Writes to characteristic 11009/11001 are
+        silently ignored in this mode.
+
+        When daylight mode is **disabled** (manual mode) the lamp accepts
+        explicit brightness and colour-temperature writes from Home Assistant.
+
+        Writes to service 0020, characteristic 0021 using the Dyson
+        write-attribute protocol (source: q90.C30568o, q90.C30554a).
+
+        Args:
+            enabled: ``True`` to enable daylight mode, ``False`` to disable.
+
+        Raises:
+            RuntimeError: If the lamp is not connected and authenticated.
+        """
+        if not self.is_connected or self._client is None:
+            raise RuntimeError(f"{self.serial_number} is not connected")
+        async with self._lock:
+            payload = (
+                BLE_DAYLIGHT_MODE_ENABLE_PAYLOAD
+                if enabled
+                else BLE_DAYLIGHT_MODE_DISABLE_PAYLOAD
+            )
+            _LOGGER.debug(
+                "Setting daylight mode %s on %s (char 0021, payload=%s)",
+                "ON" if enabled else "OFF",
+                self.serial_number,
+                payload.hex(),
+            )
+            await self._client.write_gatt_char(
+                BLE_WRITE_ATTR_CHAR_UUID,
+                payload,
+                response=self._wants_write_request(BLE_WRITE_ATTR_CHAR_UUID),
+            )
+            self.state.daylight_mode = enabled
+            if enabled:
+                self._manual_mode_valid_until = 0.0
+            else:
+                await asyncio.sleep(0.2)
+                self._manual_mode_valid_until = (
+                    asyncio.get_running_loop().time() + _MANUAL_MODE_SESSION_SECONDS
+                )
+            self._fire_state_change()
+
+    async def set_brightness(self, ha_brightness: int) -> None:
+        """Set brightness.
+
+        Daylight-capable devices use characteristic 11009 as uint16
+        little-endian lumens (100–1000). Other devices retain characteristic
+        11000 as a one-byte percentage (0–100).
+
+        Daylight mode is disabled first (char 0021) so the lamp accepts the
+        manual brightness write rather than ignoring it.
+
+        Daylight mode is disabled first (char 0021) so the lamp accepts the
+        manual brightness write rather than ignoring it.
+
+        Args:
+            ha_brightness: Home Assistant brightness value (0–255).
+
+        Raises:
+            RuntimeError: If the lamp is not connected and authenticated.
+        """
+        if not self.is_connected or self._client is None:
+            raise RuntimeError(f"{self.serial_number} is not connected")
+        async with self._lock:
+            if self._daylight_capable:
+                await self._disable_daylight_mode()
+                raw = ha_to_raw_brightness_lumens(ha_brightness)
+                payload = raw.to_bytes(2, byteorder="little")
+                unit = "lm"
+            else:
+                raw = ha_to_raw_brightness(ha_brightness)
+                payload = bytes([raw])
+                unit = "%"
+            _LOGGER.debug(
+                "Writing brightness to %s: HA %d → %d %s (char=%s, payload=%s)",
+                self.serial_number,
+                ha_brightness,
+                raw,
+                unit,
+                self._brightness_uuid,
+                payload.hex(),
+            )
+            await self._client.write_gatt_char(
+                self._brightness_uuid,
+                payload,
+                # Verified on the Morph family: 11009 applies unacknowledged
+                # writes (the exact lumen value reads back), while an ATT Write
+                # Request is refused with 0x03 Write Not Permitted.
+                response=self._wants_write_request(self._brightness_uuid),
+            )
+            # Update state optimistically from the written value.
+            # GATT reads via a BLE proxy can take several seconds each;
+            # BLE notifications will keep state current.
+            self.state.brightness_raw = raw
+            self.state.brightness = (
+                raw_lumens_to_ha_brightness(raw)
+                if self._daylight_capable
+                else raw_to_ha_brightness(raw)
+            )
+            self._fire_state_change()
+
+    async def set_color_temp_kelvin(self, kelvin: int) -> None:
+        """Set color temperature in Kelvin.
+
+        Writes to characteristic 11001 as a uint16 little-endian Kelvin value
+        (2700–6500 K).  Daylight mode is disabled first (char 0021) so the
+        lamp accepts the manual colour-temperature write.
+
+        Args:
+            kelvin: Color temperature in Kelvin (clamped to 2700–6500).
+
+        Raises:
+            RuntimeError: If the lamp is not connected and authenticated.
+        """
+        if not self.is_connected or self._client is None:
+            raise RuntimeError(f"{self.serial_number} is not connected")
+        async with self._lock:
+            await self._disable_daylight_mode()
+            kelvin_clamped = max(BLE_MIN_KELVIN, min(BLE_MAX_KELVIN, kelvin))
+            payload = kelvin_clamped.to_bytes(2, byteorder="little")
+            _LOGGER.debug(
+                "Writing color temp to %s: %d K (clamped from %d K) "
+                "(char 11001=%s, payload=%s)",
+                self.serial_number,
+                kelvin_clamped,
+                kelvin,
+                BLE_COLOR_TEMP_UUID,
+                payload.hex(),
+            )
+            await self._client.write_gatt_char(
+                BLE_COLOR_TEMP_UUID,
+                payload,
+                # As with brightness: follow the advertised property, because the
+                # Morph family refuses Write Requests on 11001.
+                response=self._wants_write_request(BLE_COLOR_TEMP_UUID),
+            )
+            # Update state optimistically from the written value.
+            # GATT reads via a BLE proxy can take several seconds each;
+            # BLE notifications will keep state current.
+            self.state.color_temp_kelvin = kelvin_clamped
+            self.state.color_temp_mired = kelvin_to_mired(kelvin_clamped)
+            self._fire_state_change()
+
+    async def set_color_temp_mired(self, mired: int) -> None:
+        """Set color temperature in mired.
+
+        Args:
+            mired: Color temperature in mired (converted to Kelvin internally).
+
+        Raises:
+            RuntimeError: If the lamp is not connected and authenticated.
+        """
+        await self.set_color_temp_kelvin(mired_to_kelvin(mired))
+
+    async def poll_state(self) -> None:
+        """Fire the current cached state to HA.
+
+        Called by the keepalive loop to ensure entities reflect the latest
+        known state.  State is primarily updated via BLE notifications;
+        this is a backstop to push cached state that may not have been fired
+        yet (e.g., after reconnection).
+
+        Deliberately does *not* perform GATT reads: reads take up to 30 s to
+        time out via a proxy, and holding ``_lock`` that long blocks all
+        concurrent service calls (set_power, set_brightness, etc.).
+        """
+        if not self.is_connected:
+            return
+        self._fire_state_change()
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        """Return device info dict for the HA device registry."""
+        info: dict[str, Any] = {
+            "identifiers": {(DOMAIN, self.serial_number)},
+            "name": f"Dyson {self.serial_number}",
+            "manufacturer": "Dyson",
+            "model": "Lightcycle Morph",
+        }
+        if self.state.firmware_major is not None:
+            info["sw_version"] = (
+                f"{self.state.firmware_major}.{self.state.firmware_minor}"
+                f".{self.state.firmware_build}"
+            )
+        return info

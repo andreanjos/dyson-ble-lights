@@ -1,0 +1,2649 @@
+"""Config flow for Dyson integration."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Any
+from urllib.parse import urlparse
+
+import voluptuous as vol
+from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlowResult
+from homeassistant.core import callback
+from homeassistant.data_entry_flow import AbortFlow
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
+
+from .const import (
+    AVAILABLE_CAPABILITIES,
+    AVAILABLE_DEVICE_CATEGORIES,
+    BLE_DEVICE_KIND_LIGHT,
+    BLE_DEVICE_KIND_VACUUM,
+    BLE_LTK_FALLBACK_CODE,
+    BLE_SERVICE_UUID,
+    CONF_AUTO_ADD_DEVICES,
+    CONF_BLE_DEVICE_KIND,
+    CONF_BLE_MAC,
+    CONF_BLE_PROXY,
+    CONF_COUNTRY,
+    CONF_CREDENTIAL,
+    CONF_CULTURE,
+    CONF_DHCP_HOST,
+    CONF_DISCOVERY_METHOD,
+    CONF_HOSTNAME,
+    CONF_LTK,
+    CONF_MQTT_PREFIX,
+    CONF_POLL_FOR_DEVICES,
+    CONF_SERIAL_NUMBER,
+    DEFAULT_AUTO_ADD_DEVICES,
+    DEFAULT_POLL_FOR_DEVICES,
+    DEVICE_CATEGORY_FLRC,
+    DEVICE_CATEGORY_LIGHT,
+    DISCOVERY_CLOUD,
+    DOMAIN,
+    MDNS_SERVICE_DYSON,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+# Connection type display names for UI
+CONNECTION_TYPE_NAMES = {
+    "local_only": "Local Only",
+    "local_cloud_fallback": "Local with Cloud Fallback",
+    "cloud_local_fallback": "Cloud with Local Fallback",
+    "cloud_only": "Cloud Only",
+}
+
+
+def _get_connection_type_display_name(connection_type: str) -> str:
+    """Get user-friendly display name for connection type."""
+    return CONNECTION_TYPE_NAMES.get(connection_type, connection_type)
+
+
+def _get_api_fqdn(country: str) -> str:
+    """Return the API FQDN for the given country code."""
+    try:
+        from libdyson_rest.utils import get_api_hostname
+
+        return urlparse(get_api_hostname(country)).netloc
+    except Exception:
+        return "appapi.cp.dyson.com"
+
+
+def _get_setup_method_options() -> dict[str, str]:
+    """Get setup method options for the config flow."""
+    return {
+        "cloud_account": "Dyson Cloud Account (Recommended)",
+        "manual_device": "Manual Device Setup",
+        "ble_light": "Dyson BLE Light (e.g. Lightcycle Morph)",
+        "ble_vacuum": "Dyson BLE Vacuum (e.g. V16 floor-care vacuums)",
+    }
+
+
+def _get_connection_type_options() -> dict[str, str]:
+    """Get connection type options for the config flow."""
+    return CONNECTION_TYPE_NAMES.copy()
+
+
+def _get_default_country_culture(hass) -> tuple[str, str]:
+    """Get default country and culture from Home Assistant configuration.
+
+    Returns:
+        tuple: (country, culture) where:
+            - country: 2-letter uppercase ISO 3166-1 alpha-2 code
+            - culture: IETF language tag format (e.g., 'en-US')
+    """
+    import re
+
+    # Handle test mocks that might not have config attribute
+    try:
+        hass_config = getattr(hass, "config", None)
+        if hass_config is None:
+            # Fallback for tests or cases where config is not available
+            return "US", "en-US"
+
+        # Get country from HA config, default to US if not set
+        ha_country = getattr(hass_config, "country", None) or "US"
+        country = ha_country.upper() if ha_country else "US"
+
+        # Get language from HA config, default to en if not set
+        ha_language = getattr(hass_config, "language", None) or "en"
+
+        # Normalize culture format to xx-YY (e.g., 'en-US', 'zh-CN')
+        # Replace underscores with hyphens (e.g., 'zh_CN' -> 'zh-CN')
+        ha_language = ha_language.replace("_", "-")
+
+        # Validate culture format: must be exactly 5 characters in xx-YY format
+        culture_pattern = re.compile(r"^[a-z]{2}-[A-Z]{2}$")
+
+        # Extended BCP 47 format pattern (e.g., 'zh-Hans-CN', 'zh-Hant-TW')
+        extended_pattern = re.compile(r"^([a-z]{2})-[A-Za-z]+-([A-Z]{2})$")
+
+        if culture_pattern.match(ha_language):
+            # Already in correct format (e.g., 'en-US')
+            culture = ha_language
+        elif extended_match := extended_pattern.match(ha_language):
+            # Extended format like 'zh-Hans-CN' - extract language and country
+            language_code = extended_match.group(1)
+            country_code = extended_match.group(2)
+            culture = f"{language_code}-{country_code}"
+        elif len(ha_language) == 2:
+            # Just a language code (e.g., 'en'), combine with country
+            culture = f"{ha_language.lower()}-{country.upper()}"
+        elif len(ha_language) == 5 and "-" in ha_language:
+            # Has hyphen but wrong case, fix it
+            parts = ha_language.split("-")
+            culture = f"{parts[0].lower()}-{parts[1].upper()}"
+        else:
+            # Invalid format, use language code + country
+            lang_code = ha_language[:2].lower() if len(ha_language) >= 2 else "en"
+            culture = f"{lang_code}-{country.upper()}"
+
+        return country, culture
+    except (AttributeError, TypeError):
+        # Fallback for any unexpected issues (e.g., during testing)
+        return "US", "en-US"
+
+
+def _get_connection_type_options_detailed() -> dict[str, str]:
+    """Get detailed connection type options for the config flow."""
+    return {
+        "local_only": "Local Only (Maximum Privacy, No Internet Required)",
+        "local_cloud_fallback": "Local with Cloud Fallback (Recommended)",
+        "cloud_local_fallback": "Cloud with Local Fallback (More Reliable)",
+        "cloud_only": "Cloud Only (For Networks Without mDNS/Zeroconf)",
+    }
+
+
+def _get_management_actions() -> dict[str, str]:
+    """Get management action options for the options flow."""
+    return {
+        "reload_all": "🔄 Reload All Devices",
+        "reconfigure_connection": "⚙️ Reconfigure Default Connection Settings",
+        "cloud_preferences": "☁️ Configure Cloud Account Settings",
+        "reauthenticate": "🔑 Re-authenticate Dyson Account",
+    }
+
+
+def _get_device_connection_options(account_connection_type: str) -> dict[str, str]:
+    """Get device-specific connection options for individual device configuration."""
+    return {
+        "use_account_default": f"📋 Use Account Default ({_get_connection_type_display_name(account_connection_type)})",
+        "local_only": "🔒 Local Only (Maximum Privacy, No Internet Required)",
+        "local_cloud_fallback": "🏠 Local with Cloud Fallback (Recommended)",
+        "cloud_local_fallback": "☁️ Cloud with Local Fallback (More Reliable)",
+        "cloud_only": "🌐 Cloud Only (For Networks Without mDNS/Zeroconf)",
+    }
+
+
+async def _discover_device_via_mdns(
+    hass, serial_number: str, timeout: int = 10
+) -> str | None:  # noqa: C901
+    """Discover Dyson device via mDNS using Home Assistant's shared zeroconf instance.
+
+    Args:
+        hass: Home Assistant instance
+        serial_number: Device serial number to search for
+        timeout: Discovery timeout in seconds
+
+    Returns:
+        IP address if found, None otherwise
+    """
+    from homeassistant.components import zeroconf
+
+    from .device_utils import mask_serial
+
+    try:
+        # Get Home Assistant's shared zeroconf instance
+        zeroconf_instance = await zeroconf.async_get_instance(hass)
+        if zeroconf_instance is None:
+            _LOGGER.warning("Unable to get shared zeroconf instance")
+            return None
+
+        def _find_device():
+            """Synchronous mDNS discovery function."""
+            try:
+                from zeroconf import (
+                    AddressResolver,
+                    IPVersion,
+                    ServiceBrowser,
+                    ServiceListener,
+                )
+
+                # Devices announce "<product_type>_<serial>.<service>" (e.g. "527_XXX-AU-YYY"),
+                # so browse the service type and match on the serial suffix. Only record names
+                # in the callback (it runs on zeroconf's thread); look them up from here.
+                names: list[str] = []
+
+                class _Listener(ServiceListener):
+                    def add_service(self, zc, type_, name):
+                        if name.split(".")[0].endswith(serial_number):
+                            names.append(name)
+
+                    def update_service(self, zc, type_, name):
+                        pass
+
+                    def remove_service(self, zc, type_, name):
+                        pass
+
+                browser = ServiceBrowser(
+                    zeroconf_instance, MDNS_SERVICE_DYSON, _Listener()
+                )
+                try:
+                    # Budget: half the timeout for browsing, a third for the hostname
+                    # fallback below, so both fit inside the caller's wait_for().
+                    deadline = time.monotonic() + max(0.5, timeout / 2)
+                    while not names and time.monotonic() < deadline:
+                        time.sleep(0.25)
+                    for name in names:
+                        services = zeroconf_instance.get_service_info(
+                            MDNS_SERVICE_DYSON, name
+                        )
+                        if services:
+                            addrs = services.parsed_addresses(IPVersion.V4Only)
+                            if addrs:
+                                return addrs[0]
+                finally:
+                    browser.cancel()
+
+                # Fall back to the hostname, resolved through HA's mDNS listener rather than the
+                # OS resolver: Dyson devices answer with IP TTL 16 (RFC 6762 requires 255) and
+                # systemd-resolved drops such replies.
+                resolver = AddressResolver(f"{serial_number}.local.")
+                if resolver.request(zeroconf_instance, int(timeout * 1000 / 3)):
+                    addrs = resolver.ip_addresses_by_version(IPVersion.V4Only)
+                    if addrs:
+                        return str(addrs[0])
+
+            except Exception as e:
+                _LOGGER.debug(
+                    "mDNS discovery error for %s: %s", mask_serial(serial_number), e
+                )
+                return None
+
+        # Run discovery in executor to avoid blocking
+        try:
+            return await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, _find_device),
+                timeout=timeout,
+            )
+        except TimeoutError:
+            _LOGGER.debug(
+                "mDNS discovery timeout for device %s", mask_serial(serial_number)
+            )
+            return None
+    except Exception as e:
+        _LOGGER.debug("Error getting zeroconf instance: %s", e)
+        return None
+
+
+def _is_mobile_number(credential: str) -> bool:
+    """Check if the credential is a mobile number (starts with +).
+
+    Args:
+        credential: Email or mobile number string
+
+    Returns:
+        True if it appears to be a mobile number, False otherwise
+    """
+    return credential.strip().startswith("+")
+
+
+def _is_cn_mobile_auth(country: str, credential: str) -> bool:
+    """Check if mobile authentication should be used (CN region only).
+
+    CN region users must use mobile number authentication and cannot use email.
+
+    Args:
+        country: Country code (e.g., "CN", "US")
+        credential: Email or mobile number (unused, kept for API compatibility)
+
+    Returns:
+        True if mobile authentication should be used (CN region), False otherwise
+    """
+    return country.upper() == "CN"
+
+
+class DysonConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for Dyson."""
+
+    VERSION = 1
+
+    def __init__(self) -> None:
+        """Initialize the config flow."""
+        _LOGGER.info("DysonConfigFlow.__init__ called")
+        super().__init__()
+        self._email: str | None = None
+        self._password: str | None = None
+        self._cloud_client = None  # type: ignore
+        self._challenge_id: str | None = None
+        self._discovered_devices = None  # type: ignore
+        self._connection_type: str | None = None
+        self._country: str | None = None  # Store country for mobile auth detection
+        self._culture: str | None = None  # Store culture for complete_login
+        self._account_uuid: str | None = None  # Dyson account UUID from login
+        self._reauth_entry: config_entries.ConfigEntry | None = (
+            None  # set during reauth
+        )
+        # BLE pairing state
+        self._ble_mac: str | None = None
+        self._ble_serial: str | None = None
+        self._ble_capabilities: list[str] = []
+        self._ble_found_devices: list[tuple[str, str]] = []  # (mac, name)
+        # Which BLE device family the current flow serves: "light" (default)
+        # or "vacuum" (floor-cleaners like the V16 Piston Animal).  Stored in
+        # the created config entry so entry setup can route accordingly.
+        self._ble_kind: str = BLE_DEVICE_KIND_LIGHT
+
+    @staticmethod
+    def _normalize_discovery_categories(discovery_info: Any) -> set[str]:
+        """Normalize the device-category field(s) of a discovery payload.
+
+        Cloud discovery sends either ``device_category`` (possibly a list,
+        as reported by the Dyson account API) or a scalar ``category``;
+        values may be strings or enum-like objects.  Returns a lowercase set.
+        """
+        raw = discovery_info.get("device_category")
+        if raw is None:
+            raw = discovery_info.get("category")
+        if raw is None:
+            return set()
+        if isinstance(raw, (list, tuple, set, frozenset)):
+            items = list(raw)
+        else:
+            items = [raw]
+        result: set[str] = set()
+        for item in items:
+            value = getattr(item, "value", item)
+            if isinstance(value, str) and value:
+                result.add(value.lower())
+        return result
+
+    def _device_is_supported(self, device) -> bool:
+        """Check if a device is supported by this integration.
+
+        A device is supported if it either:
+        - Has MQTT credentials (lecAndWifi / wifiOnly devices), or
+        - Is a BLE-only light (connection_category == "lecOnly"), which is
+          managed via the BLE device flow but still linked to this account
+          entry for LTK auto-fetch.
+
+        Args:
+            device: Device object from libdyson-rest
+
+        Returns:
+            True if the device is supported, False otherwise.
+        """
+        name = getattr(device, "name", "Unknown")
+        try:
+            # BLE-only devices are supported (managed via BLE config entry).
+            # connection_category may be a plain string or a ConnectionCategory enum
+            # from libdyson_rest — normalise to string value before comparing.
+            connection_cat = getattr(device, "connection_category", None)
+            connection_cat_val = getattr(connection_cat, "value", connection_cat)
+            if connection_cat_val == "lecOnly":
+                _LOGGER.debug(
+                    "Device %s is a BLE-only device (lecOnly) — supported", name
+                )
+                return True
+
+            # MQTT-capable devices: require connected_configuration.mqtt.local_broker_credentials
+            connected_config = getattr(device, "connected_configuration", None)
+            if not connected_config:
+                _LOGGER.debug("Device %s has no connected_configuration", name)
+                return False
+
+            mqtt_obj = getattr(connected_config, "mqtt", None)
+            if not mqtt_obj:
+                _LOGGER.debug("Device %s has no MQTT configuration", name)
+                return False
+
+            encrypted_credentials = getattr(mqtt_obj, "local_broker_credentials", "")
+            if not encrypted_credentials:
+                _LOGGER.debug("Device %s has no MQTT credentials", name)
+                return False
+
+            _LOGGER.debug(
+                "Device %s has MQTT credentials (length: %s)",
+                name,
+                len(encrypted_credentials),
+            )
+            return True
+
+        except (AttributeError, TypeError) as err:
+            _LOGGER.debug("Error checking support for device %s: %s", name, err)
+            return False
+
+    async def _cleanup_cloud_client(self) -> None:
+        """Clean up the cloud client."""
+        if self._cloud_client is not None:
+            try:
+                await self._cloud_client.close()
+            except Exception as e:
+                _LOGGER.debug("Error closing cloud client: %s", e)
+            finally:
+                self._cloud_client = None
+
+    async def async_step_reauth(self, entry_data: dict[str, Any]) -> ConfigFlowResult:
+        """Handle re-authentication for an existing Dyson cloud account entry.
+
+        Called automatically by HA when a repair notification is triggered or
+        when ``entry.async_start_reauth`` is invoked.  Pre-fills stored
+        credentials and starts a new OTP challenge so the user only needs to
+        enter their password and the emailed code.
+
+        Args:
+            entry_data: Existing config entry data (passed by HA).
+
+        Returns:
+            The result of showing the reauth confirmation form.
+        """
+        self._reauth_entry = self._get_reauth_entry()
+        self._email = self._reauth_entry.data.get("email", "")
+        self._country = self._reauth_entry.data.get(CONF_COUNTRY, "US")
+        self._culture = self._reauth_entry.data.get(CONF_CULTURE, "en-US")
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show re-authentication form and initiate OTP on confirm.
+
+        The email is pre-filled from the existing entry.  On submit, an OTP
+        challenge is started and the user is routed to the normal verify step.
+
+        Args:
+            user_input: Form data submitted by the user, or None on first render.
+
+        Returns:
+            The form to display or a redirect to the verify step.
+        """
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            challenge_id, errors = await self._initiate_otp_with_dyson_api(
+                self._email or "", self._country or "US", self._culture or "en-US"
+            )
+            if challenge_id is not None:
+                self._challenge_id = challenge_id
+                if _is_cn_mobile_auth(self._country or "US", self._email or ""):
+                    return await self.async_step_verify_mobile()
+                return await self.async_step_verify()
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({}),
+            errors=errors,
+            description_placeholders={"email": self._email or ""},
+        )
+
+    def _find_entry_by_serial_hostname(
+        self, hostname: str
+    ) -> config_entries.ConfigEntry | None:
+        """Match a ``{product_type}_{serial}`` DHCP hostname to an entry."""
+        if not hostname or "_" not in hostname:
+            return None
+        serial = hostname.split("_", 1)[-1]
+        return next(
+            (
+                entry
+                for entry in self.hass.config_entries.async_entries(DOMAIN)
+                if entry.data.get(CONF_SERIAL_NUMBER) == serial
+            ),
+            None,
+        )
+
+    def _find_entry_by_ip(self, ip: str) -> config_entries.ConfigEntry | None:
+        """Match a DHCP discovery IP to an entry via config or its live host.
+
+        Used when the DHCP hostname is missing or unrecognized. Home
+        Assistant's active network scan and device-tracker-sourced watchers
+        often report a blank or router-assigned hostname instead of the
+        Dyson ``{product_type}_{serial}`` value carried in native DHCP
+        request packets, so hostname matching alone misses those events.
+        """
+        domain_data = self.hass.data.get(DOMAIN, {})
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            if not entry.data.get(CONF_SERIAL_NUMBER):
+                continue
+            if entry.data.get(CONF_HOSTNAME, "").strip() == ip:
+                return entry
+            if entry.data.get(CONF_DHCP_HOST) == ip:
+                return entry
+            coordinator = domain_data.get(entry.entry_id)
+            if getattr(getattr(coordinator, "device", None), "host", None) == ip:
+                return entry
+        return None
+
+    async def async_step_dhcp(
+        self, discovery_info: DhcpServiceInfo
+    ) -> ConfigFlowResult:
+        """Enrich an existing device's registry connections from DHCP discovery.
+
+        Home Assistant invokes this whenever it observes DHCP traffic from a
+        MAC matching one of the Dyson OUI matchers in manifest.json. The
+        entry is matched first by the ``{product_type}_{serial}`` DHCP
+        hostname Dyson devices broadcast, falling back to the discovery IP
+        against already-configured/known hosts when the hostname is missing
+        or unrecognized. This step never creates a new config entry — it
+        only records the MAC in the device registry and the IP for use by
+        ``DysonDataUpdateCoordinator._get_device_host`` and then aborts. When
+        the learned IP changes and no static ``CONF_HOSTNAME`` override is
+        configured, the entry is reloaded so the new host takes effect
+        immediately instead of waiting for the next natural reconnect.
+        """
+        matching_entry = self._find_entry_by_serial_hostname(
+            discovery_info.hostname
+        ) or self._find_entry_by_ip(discovery_info.ip)
+        if matching_entry is None:
+            return self.async_abort(reason="no_matching_device")
+        serial = matching_entry.data.get(CONF_SERIAL_NUMBER)
+
+        from homeassistant.helpers import device_registry as dr
+
+        registry = dr.async_get(self.hass)
+        device = registry.async_get_device_by_identifier(
+            (DOMAIN, serial), matching_entry.entry_id
+        )
+        if device is not None:
+            mac_connection = (
+                dr.CONNECTION_NETWORK_MAC,
+                dr.format_mac(discovery_info.macaddress),
+            )
+            if mac_connection not in device.connections:
+                registry.async_update_device(
+                    device.id,
+                    new_connections=device.connections | {mac_connection},
+                )
+
+        if matching_entry.data.get(CONF_DHCP_HOST) != discovery_info.ip:
+            self.hass.config_entries.async_update_entry(
+                matching_entry,
+                data={**matching_entry.data, CONF_DHCP_HOST: discovery_info.ip},
+            )
+            # A static hostname override always wins, so a reload can't help it.
+            if not matching_entry.data.get(CONF_HOSTNAME, "").strip():
+                self.hass.config_entries.async_schedule_reload(matching_entry.entry_id)
+
+        return self.async_abort(reason="already_configured")
+
+    async def _finish_reauth(self) -> ConfigFlowResult:
+        """Complete re-authentication by updating the existing entry in place.
+
+        Reads the fresh ``auth_token`` and ``account_uuid`` from the cloud
+        client and merges them into the existing entry data.  Reloads the
+        entry so the coordinator picks up the new credentials immediately.
+
+        Returns:
+            An ``async_update_reload_and_abort`` result that reloads the entry
+            and closes the reauth flow.
+        """
+        if self._reauth_entry is None:
+            _LOGGER.error("_finish_reauth called outside of a reauth flow")
+            return self.async_abort(reason="reauth_failed")
+
+        auth_token = getattr(self._cloud_client, "auth_token", None)
+        # Use "" (not None) when the API returns no UUID so that the
+        # _setup_account_level_entry guard (`is None`) won't re-trigger reauth.
+        # "" is falsy but is NOT None, so the guard only fires for entries where
+        # the key has never been written (get() returns None by default).
+        account_uuid: str | None = (
+            self._account_uuid or getattr(self._cloud_client, "account_id", None) or ""
+        )
+        await self._cleanup_cloud_client()
+
+        updated_data = {
+            **self._reauth_entry.data,
+            "auth_token": auth_token,
+            "account_uuid": account_uuid,
+        }
+        _LOGGER.info(
+            "Reauth complete for %s — account_uuid now set to %s",
+            self._email,
+            account_uuid[:8] + "..." if account_uuid else "(empty)",
+        )
+        return self.async_update_reload_and_abort(
+            self._reauth_entry,
+            data=updated_data,
+        )
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle the initial step - setup method selection."""
+        try:
+            _LOGGER.info(
+                "Starting async_step_user - setup method selection with user_input: %s",
+                user_input,
+            )
+            errors = {}
+
+            if user_input is not None:
+                setup_method = user_input.get("setup_method")
+                _LOGGER.info("User selected setup method: %s", setup_method)
+
+                if setup_method == "cloud_account":
+                    return await self.async_step_cloud_account()
+                elif setup_method == "manual_device":
+                    return await self.async_step_manual_device()
+                elif setup_method == "ble_light":
+                    self._ble_kind = BLE_DEVICE_KIND_LIGHT
+                    return await self.async_step_ble_discover()
+                elif setup_method == "ble_vacuum":
+                    self._ble_kind = BLE_DEVICE_KIND_VACUUM
+                    return await self.async_step_ble_discover()
+                else:
+                    _LOGGER.error("Invalid setup method selected: %s", setup_method)
+                    errors["base"] = "invalid_setup_method"
+
+            # Show the setup method selection form
+            _LOGGER.info("Showing setup method selection form")
+            try:
+                data_schema = vol.Schema(
+                    {
+                        vol.Required("setup_method"): vol.In(
+                            _get_setup_method_options()
+                        ),
+                    }
+                )
+                _LOGGER.info("Setup method selection form schema created successfully")
+
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=data_schema,
+                    errors=errors,
+                )
+            except Exception as e:
+                _LOGGER.exception("Error creating setup method selection form: %s", e)
+                raise
+        except Exception as e:
+            _LOGGER.exception("Top-level exception in async_step_user: %s", e)
+            raise
+
+    async def _initiate_otp_with_dyson_api(
+        self, credential: str, country: str = "US", culture: str = "en-US"
+    ) -> tuple[str | None, dict[str, str]]:
+        """Initiate OTP with Dyson API using email or mobile number.
+
+        For CN region with mobile number (starting with +), uses mobile authentication.
+        Otherwise uses standard email authentication.
+
+        Args:
+            credential: Email address or mobile number (with + prefix for mobile)
+            country: Country code (e.g., "CN", "US")
+            culture: Culture code (e.g., "zh-CN", "en-US")
+
+        Returns:
+            Tuple of (challenge_id, errors_dict)
+        """
+        # Import here to avoid scoping issues
+        from libdyson_rest import AsyncDysonClient
+        from libdyson_rest.exceptions import (
+            DysonAPIError,
+            DysonAuthError,
+            DysonConnectionError,
+        )
+
+        errors = {}
+        is_mobile = _is_cn_mobile_auth(country, credential)
+
+        try:
+            auth_type = "mobile" if is_mobile else "email"
+            _LOGGER.info(
+                "Initiating OTP with Dyson API using %s: %s, country: %s, culture: %s",
+                auth_type,
+                credential,
+                country,
+                culture,
+            )
+
+            # Initialize libdyson-rest client
+            # For mobile auth, still pass the mobile number as email parameter
+            self._cloud_client = await self.hass.async_add_executor_job(
+                lambda: AsyncDysonClient(
+                    email=credential, country=country, culture=culture
+                )
+            )  # type: ignore[func-returns-value]
+
+            if self._cloud_client is None:
+                raise ValueError("Failed to initialize Dyson client")
+
+            # Step 1: Provision API access (required first step)
+            _LOGGER.debug("Provisioning API access...")
+            await self._cloud_client.provision()
+            _LOGGER.debug("API provisioned successfully")
+
+            # Step 2: Check user status (validates account before auth)
+            # Note: get_user_status accepts any credential type (email or mobile)
+            _LOGGER.debug("Checking account status...")
+            try:
+                # Use standard get_user_status for all credential types
+                # The endpoint determines auth method based on credential format
+                user_status = await self._cloud_client.get_user_status(credential)
+                _LOGGER.debug(
+                    "Account status: %s, Auth method: %s",
+                    user_status.account_status.value,
+                    user_status.authentication_method.value,
+                )
+            except Exception as status_error:
+                # Some regions/endpoints may not support user status check
+                # Log warning but continue with authentication flow
+                _LOGGER.warning(
+                    "User status check failed (continuing anyway): %s", status_error
+                )
+
+            # Step 3: Begin the login process to get challenge_id
+            # This triggers the OTP (email or SMS depending on auth type)
+            _LOGGER.debug("Beginning login process (OTP initiation)...")
+            if is_mobile:
+                # Use mobile-specific begin_login (sends SMS OTP)
+                challenge = await self._cloud_client.begin_login_mobile(credential)
+                _LOGGER.info("SMS OTP sent to mobile number")
+            else:
+                # Use standard email begin_login (sends email OTP)
+                challenge = await self._cloud_client.begin_login(credential)
+                _LOGGER.info("Email OTP sent")
+
+            # Validate and store challenge ID for verification step
+            if challenge is None or challenge.challenge_id is None:
+                _LOGGER.error("No challenge received from Dyson API")
+                errors["base"] = "connection_failed"
+                return None, errors
+            else:
+                challenge_id = str(challenge.challenge_id)
+                _LOGGER.info(
+                    "Successfully initiated OTP process, challenge ID received"
+                )
+                return challenge_id, errors
+
+        except DysonAuthError as e:
+            _LOGGER.exception("Dyson OTP initiation failed: %s", e)
+            await self._cleanup_cloud_client()
+            errors["base"] = "auth_failed"
+        except DysonConnectionError as e:
+            _LOGGER.exception("Dyson connection error: %s", e)
+            await self._cleanup_cloud_client()
+            errors["base"] = "connection_failed"
+        except DysonAPIError as e:
+            _LOGGER.exception("Dyson API error: %s", e)
+            await self._cleanup_cloud_client()
+            errors["base"] = "cloud_api_error"
+        except Exception as e:
+            _LOGGER.exception("Error during Dyson OTP initiation: %s", e)
+            await self._cleanup_cloud_client()
+            errors["base"] = "auth_failed"
+
+        return None, errors
+
+    def _create_cloud_account_form(self, errors: dict[str, str]) -> ConfigFlowResult:
+        """Create the cloud account email collection form."""
+        _LOGGER.info("Showing Dyson account email collection form")
+        try:
+            # Get default country and culture from Home Assistant config
+            default_country, default_culture = _get_default_country_culture(self.hass)
+
+            data_schema = vol.Schema(
+                {
+                    vol.Required("email"): str,
+                    vol.Optional(CONF_COUNTRY, default=default_country): str,
+                    vol.Optional(CONF_CULTURE, default=default_culture): str,
+                }
+            )
+            _LOGGER.info("Email collection form schema created successfully")
+
+            _country = getattr(self, "_country", default_country)
+            _api_fqdn = _get_api_fqdn(_country)
+
+            return self.async_show_form(
+                step_id="cloud_account",
+                data_schema=data_schema,
+                errors=errors,
+                description_placeholders={
+                    "docs_url": "https://github.com/cmgrayb/hass-dyson/blob/main/docs/SETUP.md",
+                    "default_country": default_country,
+                    "default_culture": default_culture,
+                    "email": getattr(self, "_email", ""),
+                    "api_fqdn": _api_fqdn,
+                },
+            )
+        except Exception as e:
+            _LOGGER.exception("Error creating email collection form: %s", e)
+            raise
+
+    async def async_step_cloud_account(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle the cloud account email collection step."""
+        try:
+            _LOGGER.info(
+                "Starting async_step_cloud_account - Dyson account email collection with user_input: %s",
+                user_input,
+            )
+            errors: dict[str, str] = {}
+
+            if user_input is not None:
+                # Store email for verification step
+                self._email = user_input.get("email", "")
+
+                # Get country and culture from user input with fallback to HA defaults
+                country = user_input.get(CONF_COUNTRY)
+                culture = user_input.get(CONF_CULTURE)
+
+                # If not provided, get defaults from HA config
+                if not country or not culture:
+                    default_country, default_culture = _get_default_country_culture(
+                        self.hass
+                    )
+                    country = country or default_country
+                    culture = culture or default_culture
+
+                # Store country and culture for use in complete_login (mobile auth detection)
+                self._country = country
+                self._culture = culture
+
+                # Ensure we have valid email/mobile before initiating OTP
+                if self._email:
+                    # Initiate OTP with Dyson API (Step 1: email or mobile)
+                    challenge_id, errors = await self._initiate_otp_with_dyson_api(
+                        self._email, country, culture
+                    )
+
+                    if challenge_id is not None:
+                        # Store challenge_id for verification step
+                        self._challenge_id = challenge_id
+
+                        # Route to appropriate verification step based on auth type
+                        if _is_cn_mobile_auth(country, self._email):
+                            _LOGGER.info("Routing to mobile verification step for CN")
+                            return await self.async_step_verify_mobile()
+                        else:
+                            _LOGGER.info("Routing to email verification step")
+                            return await self.async_step_verify()
+                else:
+                    errors["base"] = "auth_failed"
+
+            # Show the Dyson account email collection form
+            return self._create_cloud_account_form(errors)
+
+        except Exception as e:
+            _LOGGER.exception("Top-level exception in async_step_cloud_account: %s", e)
+            raise
+
+    async def async_step_manual_device(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle manual device setup."""
+        try:
+            _LOGGER.info(
+                "Starting async_step_manual_device with user_input: %s", user_input
+            )
+            errors = {}
+
+            if user_input is not None:
+                errors = await self._process_manual_device_input(user_input)
+                if not errors:
+                    return await self._create_manual_device_entry(user_input)
+
+            # Show the manual device setup form
+            return self._show_manual_device_form(errors)
+
+        except Exception as e:
+            _LOGGER.exception("Top-level exception in async_step_manual_device: %s", e)
+            raise
+
+    async def _process_manual_device_input(
+        self, user_input: dict[str, Any]
+    ) -> dict[str, str]:
+        """Process and validate manual device input."""
+        errors = {}
+        try:
+            # Validate required fields
+            required_fields = {
+                CONF_SERIAL_NUMBER: "required",
+                CONF_CREDENTIAL: "required",
+                CONF_MQTT_PREFIX: "required",
+            }
+
+            for field, error_msg in required_fields.items():
+                if not user_input.get(field, "").strip():
+                    errors[field] = error_msg
+
+            if not errors:
+                serial_number = user_input.get(CONF_SERIAL_NUMBER, "").strip()
+                # Check if device already exists
+                await self.async_set_unique_id(serial_number)
+                self._abort_if_unique_id_configured()
+
+        except Exception as e:
+            _LOGGER.exception("Error during manual device setup: %s", e)
+            errors["base"] = "manual_setup_failed"
+
+        return errors
+
+    async def _create_manual_device_entry(
+        self, user_input: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """Create the manual device entry."""
+        from .device_utils import create_manual_device_config, mask_serial
+
+        # Get device information from user input
+        serial_number = user_input.get(CONF_SERIAL_NUMBER, "").strip()
+        credential = user_input.get(CONF_CREDENTIAL, "").strip()
+        mqtt_prefix = user_input.get(CONF_MQTT_PREFIX, "").strip()
+        hostname = user_input.get(CONF_HOSTNAME, "").strip()
+        device_name = user_input.get("device_name", f"Dyson {serial_number}").strip()
+        device_category = user_input.get(
+            "device_category", ["ec"]
+        )  # Default to Environment Cleaner list
+        capabilities = user_input.get("capabilities", [])
+
+        _LOGGER.info("Manual setup for device: %s", mask_serial(serial_number))
+
+        # Determine hostname: use provided value or discover via mDNS
+        hostname = await self._resolve_device_hostname(serial_number, hostname)
+
+        # Create the device entry with manual discovery method
+        config_data = create_manual_device_config(
+            serial_number=serial_number,
+            credential=credential,
+            mqtt_prefix=mqtt_prefix,
+            device_name=device_name,
+            hostname=hostname,
+            device_category=device_category,
+            capabilities=capabilities,
+        )
+
+        _LOGGER.info("Creating manual device config entry for: %s", device_name)
+        return self.async_create_entry(
+            title=device_name,
+            data=config_data,
+        )
+
+    async def _resolve_device_hostname(self, serial_number: str, hostname: str) -> str:
+        """Resolve device hostname either from input or via mDNS discovery."""
+        if hostname:
+            _LOGGER.info(
+                "Using provided hostname/IP for device %s: %s", serial_number, hostname
+            )
+            return hostname
+
+        # Try to discover device via mDNS
+        _LOGGER.info(
+            "No hostname provided, attempting mDNS discovery for device %s",
+            serial_number,
+        )
+        discovered_hostname = await _discover_device_via_mdns(self.hass, serial_number)
+
+        if discovered_hostname:
+            _LOGGER.info(
+                "Found device %s at IP: %s", serial_number, discovered_hostname
+            )
+            return discovered_hostname
+        else:
+            _LOGGER.warning(
+                "Could not discover device %s via mDNS, will use serial.local",
+                serial_number,
+            )
+            return f"{serial_number}.local"
+
+    def _show_manual_device_form(self, errors: dict[str, str]) -> ConfigFlowResult:
+        """Show the manual device setup form."""
+        _LOGGER.info("Showing manual device setup form")
+        try:
+            data_schema = vol.Schema(
+                {
+                    vol.Required(CONF_SERIAL_NUMBER): str,
+                    vol.Required(CONF_CREDENTIAL): str,
+                    vol.Required(CONF_MQTT_PREFIX): str,
+                    vol.Optional(CONF_HOSTNAME): str,
+                    vol.Optional("device_name"): str,
+                    vol.Optional("device_category", default=["ec"]): cv.multi_select(
+                        AVAILABLE_DEVICE_CATEGORIES
+                    ),
+                    vol.Optional("capabilities", default=[]): cv.multi_select(
+                        AVAILABLE_CAPABILITIES
+                    ),
+                }
+            )
+            _LOGGER.info("Manual device setup form schema created successfully")
+
+            return self.async_show_form(
+                step_id="manual_device",
+                data_schema=data_schema,
+                errors=errors,
+                description_placeholders={
+                    "discovery_info": "Leave IP Address blank for automatic discovery via mDNS"
+                },
+            )
+        except Exception as e:
+            _LOGGER.exception("Error creating manual device setup form: %s", e)
+            raise
+
+    async def async_step_ble_discover(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Scan for nearby Dyson BLE light devices and let the user select one.
+
+        Uses the Home Assistant bluetooth integration to find devices advertising
+        the Dyson BLE service UUID.  If no devices are found the user is taken
+        directly to the manual-configure step.
+        """
+        errors: dict[str, str] = {}
+
+        # Scan only on the first (display) call; on the second call (user_input
+        # present) the list from the first call is still in self._ble_found_devices.
+        if user_input is None:
+            self._ble_found_devices = []
+            try:
+                from homeassistant.components import bluetooth as _bt
+
+                service_infos = _bt.async_discovered_service_info(
+                    self.hass, connectable=True
+                )
+                for si in service_infos:
+                    if BLE_SERVICE_UUID in (si.service_uuids or []):
+                        name = si.name or si.address
+                        self._ble_found_devices.append((si.address, name))
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug(
+                    "BLE scan unavailable — Bluetooth integration may not be loaded"
+                )
+
+            if not self._ble_found_devices:
+                # Nothing found via BLE scan; skip straight to manual configure
+                return await self.async_step_ble_configure()
+        else:
+            selected = user_input.get("ble_device", "")
+            if selected != "manual":
+                self._ble_mac = selected
+                # Try stored scan results first (normalise case for robustness).
+                for mac, name in self._ble_found_devices:
+                    if (
+                        mac.upper() == selected.upper()
+                        and "-" in name
+                        and ":" not in name
+                    ):
+                        self._ble_serial = name.upper()
+                        break
+                # If not resolved yet, query the HA BT stack directly for the
+                # selected MAC — the device was visible seconds ago so it will
+                # still be in the cache regardless of _ble_found_devices state.
+                if not self._ble_serial:
+                    try:
+                        from homeassistant.components import bluetooth as _bt
+
+                        si = _bt.async_last_service_info(
+                            self.hass, selected, connectable=True
+                        ) or _bt.async_last_service_info(
+                            self.hass, selected, connectable=False
+                        )
+                        if si is not None:
+                            adv_name = si.name or ""
+                            if "-" in adv_name and ":" not in adv_name:
+                                self._ble_serial = adv_name.upper()
+                    except Exception:  # noqa: BLE001
+                        pass
+            return await self.async_step_ble_configure()
+
+        # Build a device-selection dropdown
+        choices: dict[str, str] = {
+            mac: f"{name} ({mac})" for mac, name in self._ble_found_devices
+        }
+        choices["manual"] = "Enter device MAC address manually"
+
+        return self.async_show_form(
+            step_id="ble_discover",
+            data_schema=vol.Schema({vol.Required("ble_device"): vol.In(choices)}),
+            errors=errors,
+            description_placeholders={
+                "device_count": str(len(self._ble_found_devices)),
+            },
+        )
+
+    async def async_step_ble_configure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Collect serial number and MAC, then attempt account-assisted LTK fetch.
+
+        If an existing Dyson cloud account entry is found in Home Assistant,
+        the LTK is fetched automatically from the Dyson cloud (no button press
+        required).  On failure the user is forwarded to the manual-entry step.
+        """
+        import re
+
+        errors: dict[str, str] = {}
+        _MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+        if user_input is not None:
+            serial = user_input.get(CONF_SERIAL_NUMBER, "").strip().upper()
+            mac = user_input.get(CONF_BLE_MAC, self._ble_mac or "").strip().upper()
+            device_name = user_input.get("device_name", f"Dyson {serial}").strip()
+
+            if not serial:
+                errors[CONF_SERIAL_NUMBER] = "required"
+            elif not _MAC_RE.match(mac):
+                errors[CONF_BLE_MAC] = "invalid_mac_address"
+
+            if not errors:
+                self._ble_mac = mac
+                self._ble_serial = serial
+                try:
+                    await self.async_set_unique_id(serial)
+                    self._abort_if_unique_id_configured()
+                except AbortFlow:
+                    errors[CONF_SERIAL_NUMBER] = "already_configured"
+
+            if not errors:
+                # Attempt account-assisted LTK retrieval (no button press needed)
+                ltk_result = await self._fetch_ltk_from_account(serial)
+                if ltk_result:
+                    ltk, account_uuid = ltk_result
+                    _LOGGER.info(
+                        "Auto-fetched LTK for BLE device %s via Dyson cloud account",
+                        serial,
+                    )
+                    config_data: dict[str, Any] = {
+                        CONF_SERIAL_NUMBER: serial,
+                        CONF_BLE_MAC: mac,
+                        CONF_LTK: ltk,
+                        "account_uuid": account_uuid,
+                        CONF_BLE_DEVICE_KIND: self._ble_kind,
+                    }
+                    if self._ble_capabilities:
+                        config_data["capabilities"] = self._ble_capabilities
+                    if user_input.get(CONF_BLE_PROXY):
+                        config_data[CONF_BLE_PROXY] = user_input[CONF_BLE_PROXY].strip()
+                    return self.async_create_entry(title=device_name, data=config_data)
+
+                # Auto-fetch failed — fall through to manual LTK entry
+                _LOGGER.info(
+                    "LTK auto-fetch failed for %s; falling back to manual entry", serial
+                )
+                return await self.async_step_ble_light()
+
+        default_serial = self._ble_serial or ""
+        default_mac = self._ble_mac or ""
+
+        # If we know the serial but not the MAC, try to resolve it from the HA
+        # Bluetooth cache.  Dyson BLE devices advertise their serial number as
+        # the BLE device name (e.g. "CD06-GB-ABC1234A"), so a name match is
+        # sufficient.  We search all discovered service infos — not only those
+        # advertising the Dyson service UUID — because the device may not be in
+        # pairing mode and still be visible as a connectable advertisement.
+        if default_serial and not default_mac:
+            try:
+                from homeassistant.components import bluetooth as _bt
+
+                for si in _bt.async_discovered_service_info(
+                    self.hass, connectable=True
+                ):
+                    adv_name = (si.name or "").upper()
+                    if adv_name == default_serial.upper():
+                        default_mac = si.address
+                        self._ble_mac = default_mac
+                        _LOGGER.info(
+                            "Auto-resolved MAC for BLE device %s from Bluetooth cache: %s",
+                            default_serial,
+                            default_mac,
+                        )
+                        break
+
+                # Fall back to non-connectable advertisements if not found above
+                if not default_mac:
+                    for si in _bt.async_discovered_service_info(
+                        self.hass, connectable=False
+                    ):
+                        adv_name = (si.name or "").upper()
+                        if adv_name == default_serial.upper():
+                            default_mac = si.address
+                            self._ble_mac = default_mac
+                            _LOGGER.info(
+                                "Auto-resolved MAC for BLE device %s from non-connectable cache: %s",
+                                default_serial,
+                                default_mac,
+                            )
+                            break
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Bluetooth MAC auto-resolve unavailable for %s", default_serial
+                )
+
+        data_schema = vol.Schema(
+            {
+                vol.Required(CONF_SERIAL_NUMBER, default=default_serial): str,
+                vol.Required(CONF_BLE_MAC, default=default_mac): str,
+                vol.Optional("device_name"): str,
+                vol.Optional(CONF_BLE_PROXY): str,
+            }
+        )
+        return self.async_show_form(
+            step_id="ble_configure",
+            data_schema=data_schema,
+            errors=errors,
+            description_placeholders={
+                "docs_url": "https://github.com/cmgrayb/hass-dyson/blob/main/docs/SETUP.md",
+            },
+        )
+
+    async def _fetch_ltk_from_account(self, serial: str) -> tuple[str, str] | None:
+        """Try to fetch the device LTK from any Dyson cloud account configured in HA.
+
+        Iterates over all DOMAIN config entries that carry an auth_token and
+        attempts the ``GET /v1/lec/<serial>/ltk`` endpoint using the fallback
+        auth-code ``80541406`` (documented in the Dyson BLE protocol).
+
+        Args:
+            serial: The device serial number (uppercase).
+
+        Returns:
+            A ``(ltk_hex, account_uuid)`` tuple on success, or ``None`` if no
+            account is available or the cloud endpoint does not return a valid LTK.
+        """
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            auth_token = entry.data.get("auth_token")
+            if not auth_token:
+                continue
+            ltk = await self.hass.async_add_executor_job(
+                self._cloud_fetch_ltk, serial, auth_token
+            )
+            if ltk:
+                account_uuid = entry.data.get("account_uuid") or ""
+                return ltk, account_uuid
+        return None
+
+    def _cloud_fetch_ltk(self, serial: str, auth_token: str) -> str | None:
+        """Fetch the device LTK from the Dyson cloud synchronously.
+
+        This is a blocking HTTP call intended to be invoked via
+        ``hass.async_add_executor_job``.  It tries the well-known fallback
+        auth-code ``80541406`` against each of the Dyson API base URLs.
+
+        Args:
+            serial: The device serial number.
+            auth_token: Bearer token from an existing Dyson cloud account.
+
+        Returns:
+            The LTK hex string on success, or ``None`` on any failure.
+        """
+        import json
+        import ssl
+        import urllib.error
+        import urllib.request
+
+        base_urls = [
+            "https://appapi.cp.dyson.com",
+            "https://api.dyson.com",
+            "https://linkapp-api.dyson.com",
+        ]
+        api_auth_code = BLE_LTK_FALLBACK_CODE
+        ssl_ctx = ssl.create_default_context()
+
+        for base_url in base_urls:
+            try:
+                url = f"{base_url}/v1/lec/{serial}/ltk"
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {auth_token}",
+                        "X-Dyson-ApiAuthCode": api_auth_code,
+                        "Accept": "application/json",
+                    },
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
+                    data = json.loads(resp.read())
+                    ltk = data.get("ltk")
+                    if ltk and isinstance(ltk, str):
+                        return ltk
+            except urllib.error.HTTPError as err:
+                _LOGGER.debug(
+                    "LTK fetch HTTP %s from %s for %s", err.code, base_url, serial
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "LTK fetch error from %s for %s: %s", base_url, serial, err
+                )
+
+        return None
+
+    async def async_step_ble_light(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle BLE light device setup (e.g. Dyson Lightcycle Morph CD06).
+
+        Collects the device serial number, BLE MAC address, and LTK.  The LTK
+        can be obtained automatically via Dyson cloud auth or entered manually.
+        """
+        import re
+
+        from .device_utils import mask_serial
+
+        errors: dict[str, str] = {}
+        _MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+        if user_input is not None:
+            serial = user_input.get(CONF_SERIAL_NUMBER, "").strip().upper()
+            mac = user_input.get(CONF_BLE_MAC, "").strip().upper()
+            ltk_hex = user_input.get(CONF_LTK, "").strip().lower()
+            device_name = user_input.get("device_name", f"Dyson {serial}").strip()
+
+            # Validate serial
+            if not serial:
+                errors[CONF_SERIAL_NUMBER] = "required"
+            # Validate MAC address format
+            elif not _MAC_RE.match(mac):
+                errors[CONF_BLE_MAC] = "invalid_mac_address"
+            # Validate LTK is a hex string of even length
+            elif (
+                not ltk_hex
+                or not all(c in "0123456789abcdef" for c in ltk_hex)
+                or len(ltk_hex) % 2 != 0
+            ):
+                errors[CONF_LTK] = "invalid_ltk"
+
+            if not errors:
+                try:
+                    await self.async_set_unique_id(serial)
+                    self._abort_if_unique_id_configured()
+                except Exception:  # noqa: BLE001
+                    errors[CONF_SERIAL_NUMBER] = "already_configured"
+
+            if not errors:
+                # Resolve account_uuid from any existing cloud account entry so
+                # the coordinator can build a valid PayloadA for LTK re-auth.
+                account_uuid: str | None = None
+                for _e in self.hass.config_entries.async_entries(DOMAIN):
+                    candidate = _e.data.get("account_uuid")
+                    if candidate:
+                        account_uuid = candidate
+                        break
+                if account_uuid is None:
+                    _LOGGER.warning(
+                        "No cloud account entry with account_uuid found — "
+                        "BLE device %s may fail LTK re-auth (PayloadA will use "
+                        "an empty UUID). Set up a Dyson cloud account first.",
+                        serial,
+                    )
+                    errors["base"] = "no_account_uuid_for_ble"
+
+            if not errors:
+                _LOGGER.info(
+                    "Creating BLE light config entry for %s (%s)",
+                    mask_serial(serial),
+                    mac,
+                )
+                config_data: dict[str, Any] = {
+                    CONF_SERIAL_NUMBER: serial,
+                    CONF_BLE_MAC: mac,
+                    CONF_LTK: ltk_hex,
+                    "account_uuid": account_uuid,
+                    CONF_BLE_DEVICE_KIND: self._ble_kind,
+                }
+                if self._ble_capabilities:
+                    config_data["capabilities"] = self._ble_capabilities
+                if user_input.get(CONF_BLE_PROXY):
+                    config_data[CONF_BLE_PROXY] = user_input[CONF_BLE_PROXY].strip()
+                return self.async_create_entry(title=device_name, data=config_data)
+
+        # Pre-fill serial/MAC if they were already captured in a prior step
+        default_serial = self._ble_serial or ""
+        default_mac = self._ble_mac or ""
+        data_schema = vol.Schema(
+            {
+                vol.Required(CONF_SERIAL_NUMBER, default=default_serial): str,
+                vol.Required(CONF_BLE_MAC, default=default_mac): str,
+                vol.Required(CONF_LTK): str,
+                vol.Optional("device_name"): str,
+                vol.Optional(CONF_BLE_PROXY): str,
+            }
+        )
+        return self.async_show_form(
+            step_id="ble_light",
+            data_schema=data_schema,
+            errors=errors,
+            description_placeholders={
+                "docs_url": "https://github.com/cmgrayb/hass-dyson/blob/main/docs/SETUP.md",
+                "ltk_hint": "Obtain the LTK via Dyson cloud pairing (see documentation).",
+            },
+        )
+
+    async def async_step_verify(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:  # noqa: C901
+        """Handle the email verification code and password step."""
+        try:
+            _LOGGER.info(
+                "Starting async_step_verify (email) with user_input: %s", user_input
+            )
+            errors = {}
+
+            if user_input is not None:
+                try:
+                    verification_code = user_input.get("verification_code", "")
+                    password = user_input.get("password", "")
+                    _LOGGER.info(
+                        "Received verification code and password for email authentication"
+                    )
+
+                    if not self._cloud_client or not self._challenge_id:
+                        _LOGGER.error(
+                            "Missing cloud client or challenge ID for verification"
+                        )
+                        errors["base"] = "verification_failed"
+                    elif not verification_code or not password:
+                        _LOGGER.error("Missing verification code or password")
+                        errors["base"] = "auth_failed"
+                    else:
+                        # Complete email authentication with libdyson-rest
+                        _LOGGER.debug(
+                            "Attempting complete_login with challenge_id=%s, verification_code=%s",
+                            self._challenge_id,
+                            verification_code,
+                        )
+
+                        try:
+                            # Ensure we have all required values
+                            if (
+                                not self._email
+                                or not password
+                                or not self._challenge_id
+                            ):
+                                raise ValueError(
+                                    "Missing required authentication parameters"
+                                )
+
+                            # Use standard email authentication
+                            _LOGGER.info("Using standard email authentication")
+                            await self._cloud_client.complete_login(
+                                self._challenge_id,
+                                verification_code,
+                                self._email,
+                                password,
+                            )
+                            _LOGGER.info(
+                                "Successfully authenticated with Dyson API, got auth token"
+                            )
+                            # Capture the Dyson account UUID from the client (set by complete_login)
+                            self._account_uuid = getattr(
+                                self._cloud_client, "account_id", None
+                            )
+                            # Store password for later use in device setup
+                            self._password = password
+                            if self._reauth_entry is not None:
+                                return await self._finish_reauth()
+                            return await self.async_step_connection()
+                        except Exception as complete_error:
+                            _LOGGER.error(
+                                "complete_login failed: %s (Type: %s)",
+                                complete_error,
+                                type(complete_error).__name__,
+                            )
+                            # Check if it's specifically an auth error vs other errors
+                            if "401" in str(complete_error) or "Unauthorized" in str(
+                                complete_error
+                            ):
+                                _LOGGER.error(
+                                    "Authentication failed - invalid credentials or expired challenge"
+                                )
+                                errors["base"] = "auth_failed"
+                            else:
+                                errors["base"] = "verification_failed"
+
+                except Exception as e:
+                    _LOGGER.exception("Error during email verification: %s", e)
+                    errors["base"] = "verification_failed"
+
+            # Show the email verification code and password form
+            _LOGGER.info("Showing email verification code and password form")
+            try:
+                data_schema = vol.Schema(
+                    {
+                        vol.Required("password"): str,
+                        vol.Required("verification_code"): str,
+                    }
+                )
+                _LOGGER.info("Email verification form schema created successfully")
+
+                return self.async_show_form(
+                    step_id="verify",
+                    data_schema=data_schema,
+                    errors=errors,
+                    description_placeholders={
+                        "email": getattr(self, "_email", ""),
+                        "api_fqdn": _get_api_fqdn(getattr(self, "_country", "US")),
+                    },
+                )
+            except Exception as e:
+                _LOGGER.exception("Error creating email verification form: %s", e)
+                raise
+        except Exception as e:
+            _LOGGER.exception("Top-level exception in async_step_verify: %s", e)
+            raise
+
+    async def async_step_verify_mobile(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:  # noqa: C901
+        """Handle the mobile verification code step (no password required)."""
+        try:
+            _LOGGER.info(
+                "Starting async_step_verify_mobile with user_input: %s", user_input
+            )
+            errors = {}
+
+            if user_input is not None:
+                try:
+                    verification_code = user_input.get("verification_code", "")
+                    _LOGGER.info("Received verification code for mobile authentication")
+
+                    if not self._cloud_client or not self._challenge_id:
+                        _LOGGER.error(
+                            "Missing cloud client or challenge ID for verification"
+                        )
+                        errors["base"] = "verification_failed"
+                    elif not verification_code:
+                        _LOGGER.error("Missing verification code")
+                        errors["base"] = "auth_failed"
+                    else:
+                        # Complete mobile authentication (no password required)
+                        _LOGGER.debug(
+                            "Attempting complete_login_mobile with challenge_id=%s, verification_code=%s",
+                            self._challenge_id,
+                            verification_code,
+                        )
+
+                        try:
+                            # Ensure we have all required values
+                            if not self._email or not self._challenge_id:
+                                raise ValueError(
+                                    "Missing required authentication parameters"
+                                )
+
+                            # Use mobile authentication for CN region
+                            _LOGGER.info("Using mobile authentication for CN region")
+                            # Mobile authentication: only challenge_id, otp_code, and mobile number
+                            await self._cloud_client.complete_login_mobile(
+                                self._challenge_id,
+                                verification_code,
+                                self._email,  # Mobile phone number
+                            )
+                            _LOGGER.info(
+                                "Successfully authenticated with Dyson API via mobile, got auth token"
+                            )
+                            # Capture the Dyson account UUID from the client (set by complete_login_mobile)
+                            self._account_uuid = getattr(
+                                self._cloud_client, "account_id", None
+                            )
+                            # Store empty password for consistency (mobile auth doesn't use password)
+                            self._password = ""  # nosec B105 - not a password, mobile auth uses token
+                            if self._reauth_entry is not None:
+                                return await self._finish_reauth()
+                            return await self.async_step_connection()
+                        except Exception as complete_error:
+                            _LOGGER.error(
+                                "complete_login_mobile failed: %s (Type: %s)",
+                                complete_error,
+                                type(complete_error).__name__,
+                            )
+                            # Check if it's specifically an auth error vs other errors
+                            if "401" in str(complete_error) or "Unauthorized" in str(
+                                complete_error
+                            ):
+                                _LOGGER.error(
+                                    "Authentication failed - invalid verification code or expired challenge"
+                                )
+                                errors["base"] = "auth_failed"
+                            else:
+                                errors["base"] = "verification_failed"
+
+                except Exception as e:
+                    _LOGGER.exception("Error during mobile verification: %s", e)
+                    errors["base"] = "verification_failed"
+
+            # Show the mobile verification code form (no password field)
+            _LOGGER.info("Showing mobile verification code form")
+            try:
+                data_schema = vol.Schema(
+                    {
+                        vol.Required("verification_code"): str,
+                    }
+                )
+                _LOGGER.info("Mobile verification form schema created successfully")
+
+                return self.async_show_form(
+                    step_id="verify_mobile",
+                    data_schema=data_schema,
+                    errors=errors,
+                    description_placeholders={
+                        "phone_number": getattr(self, "_email", "your phone number"),
+                        "email": getattr(self, "_email", ""),
+                        "api_fqdn": _get_api_fqdn(getattr(self, "_country", "CN")),
+                    },
+                )
+            except Exception as e:
+                _LOGGER.exception("Error creating mobile verification form: %s", e)
+                raise
+        except Exception as e:
+            _LOGGER.exception("Top-level exception in async_step_verify_mobile: %s", e)
+            raise
+
+    async def async_step_connection(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:  # noqa: C901
+        """Handle connection preferences and device selection."""
+        try:
+            _LOGGER.info(
+                "Starting async_step_connection with user_input: %s", user_input
+            )
+            errors = {}
+
+            if user_input is not None:
+                try:
+                    connection_type = user_input.get(
+                        "connection_type", "local_cloud_fallback"
+                    )
+                    _LOGGER.info("Selected connection type: %s", connection_type)
+
+                    if not self._cloud_client:
+                        _LOGGER.error("Missing cloud client for device discovery")
+                        errors["base"] = "connection_failed"
+                    else:
+                        # Discover devices using libdyson-rest
+                        _LOGGER.info("Discovering devices from Dyson API")
+                        try:
+                            devices = await self._cloud_client.get_devices()
+                        except Exception as device_error:
+                            _LOGGER.error(
+                                "Failed to retrieve devices from Dyson API: %s",
+                                device_error,
+                            )
+                            if "Expected str for name, got NoneType" in str(
+                                device_error
+                            ):
+                                _LOGGER.error(
+                                    "Device data validation failed: Some devices in your Dyson account have missing or invalid name fields. "
+                                    "This may indicate corrupted device data in your Dyson cloud account or an API response format issue."
+                                )
+                                errors["base"] = "device_data_invalid"
+                            elif "Missing required field: productType" in str(
+                                device_error
+                            ):
+                                _LOGGER.error(
+                                    "Cloud API response missing productType field - this is a known issue with libdyson-rest v0.5.0"
+                                )
+                                errors["base"] = "api_format_changed"
+                            elif "JSONValidationError" in str(device_error):
+                                _LOGGER.error(
+                                    "Cloud API response format validation failed: %s",
+                                    device_error,
+                                )
+                                errors["base"] = "api_validation_failed"
+                            else:
+                                errors["base"] = "cloud_api_error"
+                            devices = None
+
+                        if not devices:
+                            if (
+                                "base" not in errors
+                            ):  # Only set this if we don't already have a more specific error
+                                _LOGGER.warning("No devices found in Dyson account")
+                                errors["base"] = "no_devices"
+                        else:
+                            _LOGGER.info(
+                                "Found %d devices in Dyson account", len(devices)
+                            )
+
+                            # Filter devices to only those with MQTT connection support
+                            # Use allowlist approach: only add devices with valid MQTT credentials
+                            supported_devices = []
+                            skipped_devices = []
+
+                            for device in devices:
+                                device_name = getattr(device, "name", "Unknown Device")
+                                connectivity = getattr(
+                                    device, "connection_category", None
+                                )
+
+                                # Include devices with MQTT credentials (lecAndWifi/wifiOnly)
+                                # and BLE-only devices (lecOnly) — both are supported
+                                if self._device_is_supported(device):
+                                    supported_devices.append(device)
+                                else:
+                                    skipped_devices.append((device_name, connectivity))
+                                    _LOGGER.info(
+                                        "Skipping device '%s' (connectivity: %s) - not supported",
+                                        device_name,
+                                        connectivity if connectivity else "None",
+                                    )
+
+                            # Log summary if any devices were skipped
+                            if skipped_devices:
+                                _LOGGER.info(
+                                    "Skipped %d devices with unsupported connectivity types",
+                                    len(skipped_devices),
+                                )
+
+                            if not supported_devices:
+                                _LOGGER.warning(
+                                    "No supported devices found in account "
+                                    "(skipped %d unsupported).",
+                                    len(skipped_devices),
+                                )
+                                errors["base"] = "no_supported_devices"
+                                devices = None
+                            else:
+                                _LOGGER.info(
+                                    "Using %d supported devices (skipped %d unsupported)",
+                                    len(supported_devices),
+                                    len(skipped_devices),
+                                )
+                                devices = supported_devices
+
+                            # Store filtered devices and connection type for next step
+                            self._discovered_devices = devices
+                            self._connection_type = connection_type
+
+                            return await self.async_step_cloud_preferences()
+
+                except Exception as e:
+                    _LOGGER.exception("Error processing connection preferences: %s", e)
+                    errors["base"] = "connection_failed"
+
+            # Show the connection preferences form
+            _LOGGER.info("Showing connection preferences form")
+            try:
+                data_schema = vol.Schema(
+                    {
+                        vol.Required(
+                            "connection_type", default="local_cloud_fallback"
+                        ): vol.In(_get_connection_type_options_detailed()),
+                    }
+                )
+                _LOGGER.info("Connection preferences form schema created successfully")
+
+                return self.async_show_form(
+                    step_id="connection",
+                    data_schema=data_schema,
+                    errors=errors,
+                    description_placeholders={
+                        "libdyson_rest_url": "https://github.com/cmgrayb/libdyson-rest/blob/main/examples/dyson_api_device_scan.py",
+                        "opendyson_url": "https://github.com/libdyson-wg/opendyson",
+                    },
+                )
+            except Exception as e:
+                _LOGGER.exception("Error creating connection preferences form: %s", e)
+                raise
+        except Exception as e:
+            _LOGGER.exception("Top-level exception in async_step_connection: %s", e)
+            raise
+
+    async def async_step_cloud_preferences(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle cloud account preferences configuration."""
+        try:
+            _LOGGER.info(
+                "Starting async_step_cloud_preferences with user_input: %s", user_input
+            )
+            errors = {}
+
+            if user_input is not None:
+                errors = await self._process_cloud_preferences_input(user_input)
+                if not errors:
+                    return await self._create_cloud_account_entry(user_input)
+
+            # Show the cloud preferences form
+            return self._show_cloud_preferences_form(errors)
+
+        except Exception as e:
+            _LOGGER.exception(
+                "Top-level exception in async_step_cloud_preferences: %s", e
+            )
+            raise
+
+    async def _process_cloud_preferences_input(
+        self, user_input: dict[str, Any]
+    ) -> dict[str, str]:
+        """Process and validate cloud preferences input."""
+        errors = {}
+        try:
+            poll_for_devices = user_input.get(
+                CONF_POLL_FOR_DEVICES, DEFAULT_POLL_FOR_DEVICES
+            )
+            auto_add_devices = user_input.get(
+                CONF_AUTO_ADD_DEVICES, DEFAULT_AUTO_ADD_DEVICES
+            )
+
+            _LOGGER.info(
+                "Cloud preferences: poll_for_devices=%s, auto_add_devices=%s",
+                poll_for_devices,
+                auto_add_devices,
+            )
+
+            if not self._cloud_client or not self._discovered_devices:
+                _LOGGER.error("Missing cloud client or discovered devices")
+                errors["base"] = "preferences_failed"
+
+        except Exception as e:
+            _LOGGER.exception("Error processing cloud preferences: %s", e)
+            errors["base"] = "preferences_failed"
+
+        return errors
+
+    async def _create_cloud_account_entry(
+        self, user_input: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """Create the cloud account config entry."""
+        poll_for_devices = user_input.get(
+            CONF_POLL_FOR_DEVICES, DEFAULT_POLL_FOR_DEVICES
+        )
+        auto_add_devices = user_input.get(
+            CONF_AUTO_ADD_DEVICES, DEFAULT_AUTO_ADD_DEVICES
+        )
+
+        # Set unique ID based on email to prevent duplicate accounts
+        if self._email:
+            await self.async_set_unique_id(self._email.lower())
+            self._abort_if_unique_id_configured()
+
+        # Create device list from discovered devices
+        device_list: list[dict[str, Any]] = []
+        if self._discovered_devices is not None:
+            for device in self._discovered_devices:
+                # Normalise connection_category: may be a ConnectionCategory enum
+                # or a plain string — store the string value for later use.
+                conn_cat = getattr(device, "connection_category", None)
+                conn_cat_val = getattr(conn_cat, "value", conn_cat) or ""
+                device_info = {
+                    "serial_number": device.serial_number,
+                    "name": getattr(device, "name", f"Dyson {device.serial_number}"),
+                    "product_type": getattr(device, "product_type", "unknown"),
+                    "category": getattr(device, "category", "unknown"),
+                    "connection_category": conn_cat_val,
+                }
+                device_list.append(device_info)
+
+        # Get auth token and account UUID before cleanup
+        auth_token = getattr(self._cloud_client, "auth_token", None)
+        account_uuid = (
+            self._account_uuid or getattr(self._cloud_client, "account_id", None) or ""
+        )
+
+        # Clean up the cloud client
+        await self._cleanup_cloud_client()
+
+        return self.async_create_entry(
+            title=f"Dyson Account ({self._email})",
+            data={
+                "email": self._email,
+                "connection_type": self._connection_type,
+                "devices": device_list,
+                "auth_token": auth_token,
+                "account_uuid": account_uuid,
+                CONF_COUNTRY: self._country,
+                CONF_CULTURE: self._culture,
+                CONF_POLL_FOR_DEVICES: poll_for_devices,
+                CONF_AUTO_ADD_DEVICES: auto_add_devices,
+                CONF_DISCOVERY_METHOD: DISCOVERY_CLOUD,
+            },
+        )
+
+    def _show_cloud_preferences_form(self, errors: dict[str, str]) -> ConfigFlowResult:
+        """Show the cloud preferences form."""
+        _LOGGER.info("Showing cloud preferences form")
+        try:
+            data_schema = vol.Schema(
+                {
+                    vol.Required(
+                        CONF_POLL_FOR_DEVICES, default=DEFAULT_POLL_FOR_DEVICES
+                    ): bool,
+                    vol.Required(
+                        CONF_AUTO_ADD_DEVICES, default=DEFAULT_AUTO_ADD_DEVICES
+                    ): bool,
+                }
+            )
+            _LOGGER.info("Cloud preferences form schema created successfully")
+
+            device_count = (
+                len(self._discovered_devices) if self._discovered_devices else 0
+            )
+
+            return self.async_show_form(
+                step_id="cloud_preferences",
+                data_schema=data_schema,
+                errors=errors,
+                description_placeholders={
+                    "device_count": str(device_count),
+                    "email": self._email or "your account",
+                },
+            )
+        except Exception as e:
+            _LOGGER.exception("Error creating cloud preferences form: %s", e)
+            raise
+
+    async def async_step_discovery(
+        self, discovery_info: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle discovery of a Dyson device from cloud account."""
+        _LOGGER.info("Discovery step triggered for device: %s", discovery_info)
+
+        # Extract device information - check both direct and properties patterns
+        device_serial = discovery_info.get("serial_number")
+        if not device_serial and "properties" in discovery_info:
+            device_serial = discovery_info["properties"].get("serial")
+
+        device_name = discovery_info.get("name", f"Dyson {device_serial}")
+
+        if not device_serial:
+            _LOGGER.error("No serial number in discovery info: %s", discovery_info)
+            return self.async_abort(reason="invalid_discovery_info")
+
+        _LOGGER.info(
+            "Processing discovery for device %s (%s)", device_name, device_serial
+        )
+
+        # Debug logging for complete discovery info
+        _LOGGER.debug("Complete discovery_info contents: %r", discovery_info)
+        _LOGGER.debug(
+            "Discovery_info keys: %r",
+            list(discovery_info.keys()) if discovery_info else None,
+        )
+
+        # Set unique_id to prevent duplicate discoveries
+        await self.async_set_unique_id(device_serial)
+        self._abort_if_unique_id_configured()
+
+        # Store discovery info for later use
+        self.init_data = discovery_info
+        _LOGGER.debug("Stored discovery info: %s", discovery_info)
+
+        # Update context with device name for discovery card subtitle
+        self.context["title_placeholders"] = {"name": device_name}
+
+        # BLE-only (lecOnly) devices cannot be set up via the MQTT discovery path.
+        # Redirect to the BLE configure step so the user gets the correct pairing
+        # flow (MAC address entry + automatic LTK fetch) with serial pre-filled.
+        # The BLE device family (light vs floor-care vacuum) is routed by the
+        # device's declared category — previously every lecOnly device was sent
+        # to the BLE Light flow, which is wrong for vacuums (issue #434).
+        if discovery_info.get("connection_category") == "lecOnly":
+            categories = self._normalize_discovery_categories(discovery_info)
+            if DEVICE_CATEGORY_FLRC in categories:
+                _LOGGER.info(
+                    "Device %s is a BLE-only floor-cleaner (lecOnly + flrc) — "
+                    "redirecting discovery to the BLE vacuum configure flow",
+                    device_serial,
+                )
+                self._ble_kind = BLE_DEVICE_KIND_VACUUM
+            elif DEVICE_CATEGORY_LIGHT in categories:
+                _LOGGER.info(
+                    "Device %s is a BLE-only light (lecOnly + light) — "
+                    "redirecting discovery to the BLE light configure flow",
+                    device_serial,
+                )
+                self._ble_kind = BLE_DEVICE_KIND_LIGHT
+            else:
+                _LOGGER.warning(
+                    "Device %s is BLE-only (lecOnly) with unsupported category "
+                    "%r — only 'light' and 'flrc' devices are currently supported; "
+                    "falling back to the BLE light configure flow",
+                    device_serial,
+                    categories,
+                )
+                self._ble_kind = BLE_DEVICE_KIND_LIGHT
+            self._ble_serial = device_serial
+            self._ble_capabilities = discovery_info.get("capabilities", [])
+            return await self.async_step_ble_configure()
+
+        # Get better display name for device type
+        from .const import AVAILABLE_DEVICE_CATEGORIES
+        from .device_utils import mask_serial, normalize_device_category
+
+        category = discovery_info.get("category", "unknown")
+        product_type = discovery_info.get("product_type", "unknown")
+
+        # Debug logging for device categorization
+        _LOGGER.debug("Device categorization debug for %s:", mask_serial(device_serial))
+        _LOGGER.debug("  - Raw category value: %r (type: %s)", category, type(category))
+        _LOGGER.debug(
+            "  - Raw product_type value: %r (type: %s)",
+            product_type,
+            type(product_type),
+        )
+        _LOGGER.debug(
+            "  - Available categories: %r", list(AVAILABLE_DEVICE_CATEGORIES.keys())
+        )
+
+        # Normalize category from enum to string value
+        normalized_categories = normalize_device_category(category)
+        category_string = (
+            normalized_categories[0] if normalized_categories else "unknown"
+        )
+        _LOGGER.debug("  - Normalized category string: %r", category_string)
+        _LOGGER.debug(
+            "  - Category string in available categories: %s",
+            category_string in AVAILABLE_DEVICE_CATEGORIES,
+        )
+
+        # Use category display name if available, otherwise use product_type
+        if category_string in AVAILABLE_DEVICE_CATEGORIES:
+            device_type_display = AVAILABLE_DEVICE_CATEGORIES[category_string]
+            _LOGGER.debug("  - Using category display name: %r", device_type_display)
+        elif product_type != "unknown":
+            device_type_display = product_type
+            _LOGGER.debug(
+                "  - Using product_type as display name: %r", device_type_display
+            )
+        else:
+            device_type_display = "Dyson Device"
+            _LOGGER.debug("  - Falling back to default 'Dyson Device'")
+
+        _LOGGER.debug("  - Final device_type_display: %r", device_type_display)
+
+        # Show confirmation dialog to user with device name in title
+        return self.async_show_form(
+            step_id="discovery_confirm",
+            description_placeholders={
+                "device_name": device_name,
+                "device_serial": device_serial,
+                "product_type": device_type_display,
+            },
+        )
+
+    async def async_step_discovery_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle user confirmation of discovered device."""
+        if user_input is None:
+            # Get device info for placeholders
+            discovery_info = self.init_data
+            if not discovery_info:
+                _LOGGER.error("No discovery info available for form display")
+                return self.async_abort(reason="no_discovery_info")
+
+            device_serial = discovery_info["serial_number"]
+            device_name = discovery_info.get("name", f"Dyson {device_serial}")
+
+            # Get better display name for device type
+            from .const import AVAILABLE_DEVICE_CATEGORIES
+            from .device_utils import normalize_device_category
+
+            category = discovery_info.get("category", "unknown")
+            product_type = discovery_info.get("product_type", "unknown")
+
+            # Debug logging for device categorization (discovery_confirm)
+            _LOGGER.debug(
+                "Device categorization debug for %s (discovery_confirm):", device_serial
+            )
+            _LOGGER.debug(
+                "  - Raw category value: %r (type: %s)", category, type(category)
+            )
+            _LOGGER.debug(
+                "  - Raw product_type value: %r (type: %s)",
+                product_type,
+                type(product_type),
+            )
+            _LOGGER.debug(
+                "  - Available categories: %r", list(AVAILABLE_DEVICE_CATEGORIES.keys())
+            )
+
+            # Normalize category from enum to string value
+            normalized_categories = normalize_device_category(category)
+            category_string = (
+                normalized_categories[0] if normalized_categories else "unknown"
+            )
+            _LOGGER.debug("  - Normalized category string: %r", category_string)
+            _LOGGER.debug(
+                "  - Category string in available categories: %s",
+                category_string in AVAILABLE_DEVICE_CATEGORIES,
+            )
+
+            # Use category display name if available, otherwise use product_type
+            if category_string in AVAILABLE_DEVICE_CATEGORIES:
+                device_type_display = AVAILABLE_DEVICE_CATEGORIES[category_string]
+                _LOGGER.debug(
+                    "  - Using category display name: %r", device_type_display
+                )
+            elif product_type != "unknown":
+                device_type_display = product_type
+                _LOGGER.debug(
+                    "  - Using product_type as display name: %r", device_type_display
+                )
+            else:
+                device_type_display = "Dyson Device"
+                _LOGGER.debug("  - Falling back to default 'Dyson Device'")
+
+            _LOGGER.debug("  - Final device_type_display: %r", device_type_display)
+
+            # Show confirmation form with device info placeholders
+            return self.async_show_form(
+                step_id="discovery_confirm",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required("confirm", default=True): bool,
+                    }
+                ),
+                description_placeholders={
+                    "device_name": device_name,
+                    "device_serial": device_serial,
+                    "product_type": device_type_display,
+                },
+            )
+
+        if not user_input.get("confirm", False):
+            _LOGGER.info("User declined to add discovered device")
+            return self.async_abort(reason="user_declined")
+
+        # User confirmed, proceed to connection configuration
+        _LOGGER.info("User confirmed device addition, showing connection configuration")
+        return await self.async_step_discovery_connection()
+
+    async def async_step_discovery_connection(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle connection configuration for discovered device."""
+        discovery_info = self.init_data
+        if not discovery_info:
+            _LOGGER.error("No discovery info available for connection configuration")
+            return self.async_abort(reason="no_discovery_info")
+
+        device_serial = discovery_info["serial_number"]
+        device_name = discovery_info.get("name", f"Dyson {device_serial}")
+
+        if user_input is not None:
+            # User submitted connection configuration
+            connection_type = user_input.get("connection_type", "local_cloud_fallback")
+            hostname = user_input.get(CONF_HOSTNAME, "").strip()
+
+            _LOGGER.info(
+                "User configured device %s with connection type: %s, hostname: %s",
+                device_serial,
+                connection_type,
+                hostname if hostname else "(automatic discovery)",
+            )
+
+            # Create proper device config using the same method as auto-add
+            from .device_utils import create_cloud_device_config
+
+            device_info = {
+                "serial_number": device_serial,
+                "name": device_name,
+                "product_type": discovery_info.get("product_type", "unknown"),
+                "category": discovery_info.get("category", "unknown"),
+            }
+
+            config_data = create_cloud_device_config(
+                serial_number=device_serial,
+                username=discovery_info["email"],
+                device_info=device_info,
+                auth_token=discovery_info["auth_token"],
+                parent_entry_id=discovery_info["parent_entry_id"],
+                connection_type=connection_type,
+                hostname=hostname if hostname else None,
+            )
+
+            _LOGGER.info("Creating config entry for discovered device: %s", device_name)
+            return self.async_create_entry(
+                title=device_name,
+                data=config_data,
+            )
+
+        # Show connection configuration form
+        # Get parent account's connection type as default
+        parent_entry_id = discovery_info.get("parent_entry_id")
+        default_connection_type = "local_cloud_fallback"
+        if parent_entry_id:
+            parent_entries = [
+                entry
+                for entry in self.hass.config_entries.async_entries(DOMAIN)
+                if entry.entry_id == parent_entry_id
+            ]
+            if parent_entries:
+                default_connection_type = parent_entries[0].data.get(
+                    "connection_type", "local_cloud_fallback"
+                )
+
+        return self.async_show_form(
+            step_id="discovery_connection",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        "connection_type", default=default_connection_type
+                    ): vol.In(_get_connection_type_options_detailed()),
+                    vol.Optional(
+                        CONF_HOSTNAME,
+                        description="Leave blank for automatic discovery",
+                    ): str,
+                }
+            ),
+            description_placeholders={
+                "device_name": device_name,
+                "device_serial": device_serial,
+            },
+        )
+
+    async def async_step_device_auto_create(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle automatic device entry creation from account setup."""
+        _LOGGER.info("Device auto-create flow started with data: %s", user_input)
+
+        if user_input is None:
+            _LOGGER.error("Device auto-create called with no user_input")
+            return self.async_abort(reason="no_device_data")
+
+        device_serial = user_input.get(CONF_SERIAL_NUMBER)
+        device_name = user_input.get("device_name", f"Dyson {device_serial}")
+
+        _LOGGER.info(
+            "Creating device config entry for serial: %s, name: %s",
+            device_serial,
+            device_name,
+        )
+
+        # Check if device already exists
+        await self.async_set_unique_id(device_serial)
+        self._abort_if_unique_id_configured()
+
+        # Create the device entry
+        _LOGGER.info("Creating config entry with title: %s", device_name)
+        return self.async_create_entry(
+            title=device_name,
+            data=user_input,
+        )
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> config_entries.OptionsFlow:
+        """Create the options flow."""
+        return DysonOptionsFlow(config_entry)
+
+
+class DysonOptionsFlow(config_entries.OptionsFlow):
+    """Dyson config flow options handler."""
+
+    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+        """Initialize options flow."""
+        super().__init__()
+        self._config_entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the Dyson devices or individual device."""
+        # Check if this is an account entry (has multiple devices) or individual device entry
+        if "devices" in self._config_entry.data and self._config_entry.data.get(
+            "devices"
+        ):
+            # This is an account-level entry - show account management
+            return await self.async_step_manage_devices()
+        else:
+            # This is an individual device entry - show device-specific options
+            return await self.async_step_device_options()
+
+    async def async_step_manage_devices(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle the device management menu."""
+        if user_input is not None:
+            action = user_input.get("action", "")
+            if action == "reload_all":
+                return await self.async_step_reload_all()
+            elif action == "reconfigure_connection":
+                return await self.async_step_reconfigure_connection()
+            elif action == "cloud_preferences":
+                return await self.async_step_manage_cloud_preferences()
+            elif action == "reauthenticate":
+                self._config_entry.async_start_reauth(self.hass)
+                return self.async_abort(reason="reauthenticate_initiated")
+
+        # Get current devices from config entry
+        devices = self._config_entry.data.get("devices", [])
+
+        # Get child device entries
+        child_entries = [
+            entry
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+            if entry.data.get("parent_entry_id") == self._config_entry.entry_id
+        ]
+
+        # Build actions for account-level operations only
+        action_options = _get_management_actions()
+
+        # Show device status for reference (but no individual actions since devices have native controls)
+        device_status_info = []
+        for device in devices:
+            serial = device["serial_number"]
+            name = device.get("name", f"Dyson {serial}")
+
+            # Check if device has active config entry
+            device_entry = next(
+                (e for e in child_entries if e.data.get(CONF_SERIAL_NUMBER) == serial),
+                None,
+            )
+            status = "✅ Active" if device_entry else "❌ Inactive"
+            device_status_info.append(f"{name}: {status}")
+
+        status_summary = (
+            "\n".join(device_status_info) if device_status_info else "No devices found"
+        )
+
+        return self.async_show_form(
+            step_id="manage_devices",
+            data_schema=vol.Schema({vol.Required("action"): vol.In(action_options)}),
+            description_placeholders={
+                "device_count": str(len(devices)),
+                "active_count": str(len(child_entries)),
+                "account_email": self._config_entry.data.get("email", "Unknown"),
+                "device_status": status_summary,
+            },
+        )
+
+    async def async_step_reload_all(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reloading all devices."""
+        if user_input is not None:
+            if user_input.get("confirm"):
+                # Reload all child device entries
+                child_entries = [
+                    entry
+                    for entry in self.hass.config_entries.async_entries(DOMAIN)
+                    if entry.data.get("parent_entry_id") == self._config_entry.entry_id
+                ]
+
+                for child_entry in child_entries:
+                    await self.hass.config_entries.async_reload(child_entry.entry_id)
+
+                return self.async_create_entry(title="", data={})
+            else:
+                return await self.async_step_manage_devices()
+
+        child_count = len(
+            [
+                entry
+                for entry in self.hass.config_entries.async_entries(DOMAIN)
+                if entry.data.get("parent_entry_id") == self._config_entry.entry_id
+            ]
+        )
+
+        return self.async_show_form(
+            step_id="reload_all",
+            data_schema=vol.Schema({vol.Required("confirm", default=False): bool}),
+            description_placeholders={
+                "device_count": str(len(self._config_entry.data.get("devices", []))),
+                "active_count": str(child_count),
+            },
+        )
+
+    async def async_step_delete_device(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle deleting a specific device."""
+        if user_input is None:
+            return await self.async_step_manage_devices()
+
+        device_serial = user_input.get("device_serial")
+        if not device_serial:
+            return await self.async_step_manage_devices()
+
+        devices = self._config_entry.data.get("devices", [])
+        device = next((d for d in devices if d["serial_number"] == device_serial), None)
+
+        if not device:
+            return await self.async_step_manage_devices()
+
+        if user_input.get("confirm"):
+            # Remove device from the account entry
+            updated_devices = [
+                d for d in devices if d["serial_number"] != device_serial
+            ]
+
+            # Find and remove the corresponding device entry
+            device_entry = next(
+                (
+                    entry
+                    for entry in self.hass.config_entries.async_entries(DOMAIN)
+                    if (
+                        entry.data.get("parent_entry_id") == self._config_entry.entry_id
+                        and entry.data.get(CONF_SERIAL_NUMBER) == device_serial
+                    )
+                ),
+                None,
+            )
+
+            if device_entry:
+                await self.hass.config_entries.async_remove(device_entry.entry_id)
+
+            if not updated_devices:
+                # If no devices left, delete the entire account entry
+                await self.hass.config_entries.async_remove(self._config_entry.entry_id)
+                return self.async_create_entry(title="", data={})
+            else:
+                # Update the account entry with remaining devices
+                updated_data = dict(self._config_entry.data)
+                updated_data["devices"] = updated_devices
+
+                self.hass.config_entries.async_update_entry(
+                    self._config_entry,
+                    data=updated_data,
+                    title=f"Dyson Account ({len(updated_devices)} devices)",
+                )
+
+                return self.async_create_entry(title="", data={})
+
+        if "confirm" not in user_input:
+            # Find the corresponding device entry to show status
+            device_entry = next(
+                (
+                    entry
+                    for entry in self.hass.config_entries.async_entries(DOMAIN)
+                    if (
+                        entry.data.get("parent_entry_id") == self._config_entry.entry_id
+                        and entry.data.get(CONF_SERIAL_NUMBER) == device_serial
+                    )
+                ),
+                None,
+            )
+            status = "✅ Active" if device_entry else "❌ Inactive"
+
+            return self.async_show_form(
+                step_id="delete_device",
+                data_schema=vol.Schema(
+                    {
+                        vol.Required("confirm", default=False): bool,
+                        vol.Required("device_serial", default=device_serial): str,
+                    }
+                ),
+                description_placeholders={
+                    "device_name": device.get("name", f"Dyson {device_serial}"),
+                    "device_serial": device_serial,
+                    "device_status": status,
+                },
+            )
+
+        return await self.async_step_manage_devices()
+
+    async def async_step_reconfigure_connection(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguring connection settings."""
+        if user_input is not None:
+            # Update connection type
+            updated_data = dict(self._config_entry.data)
+            updated_data["connection_type"] = user_input.get("connection_type")
+
+            self.hass.config_entries.async_update_entry(
+                self._config_entry, data=updated_data
+            )
+
+            # Reload to apply changes
+            await self.hass.config_entries.async_reload(self._config_entry.entry_id)
+            return self.async_create_entry(title="", data={})
+
+        current_connection_type = self._config_entry.data.get(
+            "connection_type", "local_cloud_fallback"
+        )
+
+        return self.async_show_form(
+            step_id="reconfigure_connection",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        "connection_type", default=current_connection_type
+                    ): vol.In(_get_connection_type_options_detailed())
+                }
+            ),
+            description_placeholders={
+                "current_type": current_connection_type,
+            },
+        )
+
+    # Device-specific options flow methods
+
+    async def async_step_device_options(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle individual device options - go directly to connection settings since it's the only option."""
+        # Skip the menu and go directly to connection configuration
+        return await self.async_step_device_reconfigure_connection()
+
+    async def async_step_device_reconfigure_connection(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle individual device connection reconfiguration."""
+        if user_input is not None:
+            connection_type = user_input.get("connection_type")
+            hostname = user_input.get(CONF_HOSTNAME, "").strip()
+
+            # Update this device's connection type and hostname
+            updated_data = dict(self._config_entry.data)
+
+            if connection_type == "use_account_default":
+                # Remove device-specific override to use account default
+                updated_data.pop("connection_type", None)
+            else:
+                # Set device-specific override
+                updated_data["connection_type"] = connection_type
+
+            # Update hostname (empty string means automatic discovery)
+            if hostname:
+                updated_data[CONF_HOSTNAME] = hostname
+            else:
+                # Remove hostname to return to automatic discovery
+                updated_data.pop(CONF_HOSTNAME, None)
+
+            self.hass.config_entries.async_update_entry(
+                self._config_entry, data=updated_data
+            )
+
+            # Reload to apply changes
+            await self.hass.config_entries.async_reload(self._config_entry.entry_id)
+            return self.async_create_entry(title="", data={})
+
+        # Get current settings
+        device_connection_type = self._config_entry.data.get("connection_type")
+        current_hostname = self._config_entry.data.get(CONF_HOSTNAME, "")
+        parent_entry_id = self._config_entry.data.get("parent_entry_id")
+
+        # Get account-level connection type
+        account_connection_type = "local_cloud_fallback"  # Default fallback
+        if parent_entry_id:
+            account_entries = [
+                entry
+                for entry in self.hass.config_entries.async_entries(DOMAIN)
+                if entry.entry_id == parent_entry_id
+            ]
+            if account_entries:
+                account_connection_type = account_entries[0].data.get(
+                    "connection_type", "local_cloud_fallback"
+                )
+
+        # Determine current selection
+        if device_connection_type:
+            current_selection = device_connection_type
+        else:
+            current_selection = "use_account_default"
+
+        connection_options = _get_device_connection_options(account_connection_type)
+
+        device_name = self._config_entry.data.get("device_name", "This Device")
+
+        return self.async_show_form(
+            step_id="device_reconfigure_connection",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("connection_type", default=current_selection): vol.In(
+                        connection_options
+                    ),
+                    vol.Optional(
+                        CONF_HOSTNAME,
+                        default=current_hostname,
+                        description="Leave blank for automatic discovery",
+                    ): str,
+                }
+            ),
+            description_placeholders={
+                "device_name": device_name,
+                "account_connection_type": _get_connection_type_display_name(
+                    account_connection_type
+                ),
+                "current_setting": "Override"
+                if device_connection_type
+                else "Account Default",
+                "hostname_status": f"Static IP: {current_hostname}"
+                if current_hostname
+                else "Automatic Discovery (mDNS)",
+            },
+        )
+
+    async def async_step_manage_cloud_preferences(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle cloud account preferences management."""
+        if user_input is not None:
+            # Update cloud preferences
+            updated_data = dict(self._config_entry.data)
+            updated_data[CONF_POLL_FOR_DEVICES] = user_input.get(
+                CONF_POLL_FOR_DEVICES, DEFAULT_POLL_FOR_DEVICES
+            )
+            updated_data[CONF_AUTO_ADD_DEVICES] = user_input.get(
+                CONF_AUTO_ADD_DEVICES, DEFAULT_AUTO_ADD_DEVICES
+            )
+
+            self.hass.config_entries.async_update_entry(
+                self._config_entry, data=updated_data
+            )
+
+            # Reload to apply changes
+            await self.hass.config_entries.async_reload(self._config_entry.entry_id)
+            return self.async_create_entry(title="", data={})
+
+        # Get current settings with backward-compatible defaults
+        current_poll_for_devices = self._config_entry.data.get(
+            CONF_POLL_FOR_DEVICES, DEFAULT_POLL_FOR_DEVICES
+        )
+        current_auto_add_devices = self._config_entry.data.get(
+            CONF_AUTO_ADD_DEVICES, DEFAULT_AUTO_ADD_DEVICES
+        )
+
+        return self.async_show_form(
+            step_id="manage_cloud_preferences",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_POLL_FOR_DEVICES, default=current_poll_for_devices
+                    ): bool,
+                    vol.Required(
+                        CONF_AUTO_ADD_DEVICES, default=current_auto_add_devices
+                    ): bool,
+                }
+            ),
+            description_placeholders={
+                "email": self._config_entry.data.get("email", "your account"),
+                "device_count": str(len(self._config_entry.data.get("devices", []))),
+            },
+        )

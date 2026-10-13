@@ -1,0 +1,197 @@
+# Services configuration for Dyson Integration
+
+set_sleep_timer:
+  name: Set Sleep Timer
+  description: Set a sleep timer for the Dyson device
+  fields:
+    device_id:
+      name: Device
+      description: The Dyson device to set the timer for
+      required: true
+      selector:
+        device:
+          integration: hass_dyson
+    minutes:
+      name: Minutes
+      description: Timer duration in minutes (15-540)
+      required: true
+      selector:
+        number:
+          min: 15
+          max: 540
+          step: 15
+          unit_of_measurement: "min"
+
+cancel_sleep_timer:
+  name: Cancel Sleep Timer
+  description: Cancel the active sleep timer for the Dyson device
+  fields:
+    device_id:
+      name: Device
+      description: The Dyson device to cancel the timer for
+      required: true
+      selector:
+        device:
+          integration: hass_dyson
+
+set_oscillation_angles:
+  name: Set Oscillation Angles
+  description: Set custom oscillation angles for the Dyson device
+  fields:
+    device_id:
+      name: Device
+      description: The Dyson device to configure
+      required: true
+      selector:
+        device:
+          integration: hass_dyson
+    lower_angle:
+      name: Lower Angle
+      description: Lower oscillation angle in degrees (0-350)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 350
+          step: 5
+          unit_of_measurement: "°"
+    upper_angle:
+      name: Upper Angle
+      description: Upper oscillation angle in degrees (0-350)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 350
+          step: 5
+          unit_of_measurement: "°"
+
+refresh_account_data:
+  name: Refresh Account Data
+  description: Refresh device information from Dyson cloud account (updates entity states in background)
+  fields:
+    device_id:
+      name: Device
+      description: The Dyson device to refresh data for (optional - refreshes all if not specified)
+      required: false
+      selector:
+        device:
+          integration: hass_dyson
+
+reset_filter:
+  name: Reset Filter Life
+  description: Reset filter life counter to 100%
+  fields:
+    device_id:
+      name: Device
+      description: The Dyson device to reset filter for
+      required: true
+      selector:
+        device:
+          integration: hass_dyson
+    filter_type:
+      name: Filter Type
+      description: Type of filter to reset
+      required: true
+      selector:
+        select:
+          options:
+            - "hepa"
+            - "carbon"
+            - "both"
+
+get_cloud_devices:
+  name: Get Cloud Devices
+  description: Retrieve device information from Dyson cloud accounts for manual setup and troubleshooting.
+  fields:
+    account_email:
+      name: Account Email
+      description: Specific cloud account email (optional - uses first account if not specified).
+      example: "user@example.com"
+      required: false
+      selector:
+        text:
+    sanitize:
+      name: Sanitize Data
+      description: Remove sensitive information for safe public posting.
+      default: false
+      required: false
+      selector:
+        boolean:
+
+start_zone_clean:
+  name: Start Zone Clean (Vis Nav)
+  description: >-
+    Start a zone-specific clean on a Dyson 360 Vis Nav, targeting one or more
+    named rooms from the device's persistent map. Zones can be specified by ID
+    (e.g. "4") or by name (e.g. "Living room"). Persistent map metadata is
+    fetched from the Dyson cloud and cached for 1 hour.
+  fields:
+    device_id:
+      name: Device
+      description: The Dyson robot vacuum device to clean with.
+      required: true
+      selector:
+        device:
+          integration: hass_dyson
+    zones:
+      name: Zones
+      description: List of zone IDs or zone names to clean (e.g. ["Living room", "Hallway"]).
+      required: true
+      selector:
+        object:
+    map:
+      name: Map
+      description: >-
+        Persistent map to clean on (name or ID), for robots with more than
+        one map. When omitted, the robot's current map is used if the cloud
+        reports one, then a single stored map, then the map the requested
+        zones uniquely belong to.
+      required: false
+      example: Downstairs
+      selector:
+        text:
+
+set_zone_behaviour:
+  name: Set Zone Behaviour (Vis Nav)
+  description: >-
+    Override the cleaning strategy for a specific zone on a Dyson 360 Vis Nav.
+    Persists to Dyson cloud so the override applies to every subsequent clean —
+    same as changing the zone's cleaning behaviour in the MyDyson app.
+  fields:
+    device_id:
+      name: Device
+      description: The Dyson robot vacuum device.
+      required: true
+      selector:
+        device:
+          integration: hass_dyson
+    zone:
+      name: Zone
+      description: Zone ID or name (e.g. "Living room" or "4").
+      required: true
+      selector:
+        text:
+    cleaning_strategy:
+      name: Cleaning Strategy
+      description: >-
+        Per-zone cleaning strategy. Maps to the same four behaviours as the
+        global Vis Nav power-level select.
+      required: true
+      selector:
+        select:
+          options:
+            - auto
+            - quick
+            - quiet
+            - boost
+    map:
+      name: Map
+      description: >-
+        Persistent map the zone belongs to (name or ID), for robots with
+        more than one map. When omitted, the zone is matched across all
+        stored maps and the map is inferred when unambiguous.
+      required: false
+      example: Downstairs
+      selector:
+        text:
