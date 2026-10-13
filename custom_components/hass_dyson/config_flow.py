@@ -1322,6 +1322,10 @@ class DysonConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         errors: dict[str, str] = {}
         _MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+        _UUID_RE = re.compile(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+            r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        )
 
         if user_input is not None:
             serial = user_input.get(CONF_SERIAL_NUMBER, "").strip().upper()
@@ -1351,22 +1355,30 @@ class DysonConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     errors[CONF_SERIAL_NUMBER] = "already_configured"
 
             if not errors:
-                # Resolve account_uuid from any existing cloud account entry so
-                # the coordinator can build a valid PayloadA for LTK re-auth.
+                # Account UUID for PayloadA: accept it from the form (we have it
+                # from an existing cloud session), else fall back to any cloud
+                # account entry already configured.
                 account_uuid: str | None = None
-                for _e in self.hass.config_entries.async_entries(DOMAIN):
-                    candidate = _e.data.get("account_uuid")
-                    if candidate:
-                        account_uuid = candidate
-                        break
-                if account_uuid is None:
-                    _LOGGER.warning(
-                        "No cloud account entry with account_uuid found — "
-                        "BLE device %s may fail LTK re-auth (PayloadA will use "
-                        "an empty UUID). Set up a Dyson cloud account first.",
-                        serial,
-                    )
-                    errors["base"] = "no_account_uuid_for_ble"
+                supplied = (user_input.get("account_uuid") or "").strip()
+                if supplied:
+                    if _UUID_RE.match(supplied):
+                        account_uuid = supplied
+                    else:
+                        errors["account_uuid"] = "invalid_uuid"
+                else:
+                    for _e in self.hass.config_entries.async_entries(DOMAIN):
+                        candidate = _e.data.get("account_uuid")
+                        if candidate:
+                            account_uuid = candidate
+                            break
+                    if account_uuid is None:
+                        _LOGGER.warning(
+                            "No cloud account entry with account_uuid found — "
+                            "enter the account UUID in this form. BLE device %s "
+                            "may otherwise fail LTK re-auth.",
+                            serial,
+                        )
+                        errors["base"] = "no_account_uuid_for_ble"
 
             if not errors:
                 _LOGGER.info(
@@ -1395,6 +1407,7 @@ class DysonConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_SERIAL_NUMBER, default=default_serial): str,
                 vol.Required(CONF_BLE_MAC, default=default_mac): str,
                 vol.Required(CONF_LTK): str,
+                vol.Optional("account_uuid"): str,
                 vol.Optional("device_name"): str,
                 vol.Optional(CONF_BLE_PROXY): str,
             }
